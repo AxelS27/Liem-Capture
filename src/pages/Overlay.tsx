@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
@@ -54,21 +54,29 @@ const MODES = [
   { key: "3", label: "Scroll",     disabled: true  },
 ] as const;
 
-function ModeSelector({ onSelect, onClose: _onClose }: { onSelect: (key: string) => void; onClose: () => void }) {
+function ModeSelector({
+  isClosing,
+  onSelect,
+  onClose: _onClose,
+}: {
+  isClosing: boolean;
+  onSelect: (key: string) => void;
+  onClose: () => void;
+}) {
   return (
     <motion.div
       className="fixed inset-0 flex items-center justify-center"
       style={{ background: "rgba(0,0,0,0.74)" }}
       initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: 0.12, ease: "easeOut" }}
+      animate={{ opacity: isClosing ? 0 : 1 }}
+      transition={{ opacity: { duration: 0.12, ease: "easeOut" } }}
     >
       <motion.div
-        initial={{ opacity: 0, scale: 0.94, y: 10 }}
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        exit={{ opacity: 0 }}
-        transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
+        initial={{ opacity: 0 }}
+        animate={{ opacity: isClosing ? 0 : 1 }}
+        transition={{
+          opacity: { duration: isClosing ? 0 : 0.12, ease: "easeOut" },
+        }}
         className="w-[500px] max-w-[calc(100vw-32px)] rounded-[18px] overflow-hidden"
         style={{
           background: "rgba(255,255,255,0.08)",
@@ -119,7 +127,10 @@ export default function Overlay() {
   const isDragging = useRef(false);
   const rafRef     = useRef<number>(0);
   const modeRef    = useRef<Mode>("select");
+  const closeTimerRef = useRef<number | null>(null);
   const [mode, setMode] = useState<Mode>("select");
+  const [overlayClosing, setOverlayClosing] = useState(false);
+  const [selectorClosing, setSelectorClosing] = useState(false);
 
   // Keep ref in sync so event handlers always see latest mode without re-registering
   useEffect(() => { modeRef.current = mode; }, [mode]);
@@ -140,23 +151,49 @@ export default function Overlay() {
 
   // ── close: synchronous, fire-and-forget hide via Rust ──────────────────────
   const close = useCallback(() => {
-    invoke("hide_overlay").catch(() => {});
-    setMode("select");
-    modeRef.current = "select";
+    if (closeTimerRef.current !== null) {
+      return;
+    }
+
+    const closingMode = modeRef.current;
+    setOverlayClosing(true);
+    setSelectorClosing(closingMode === "select");
     startPt.current = null;
     isDragging.current = false;
+
+    closeTimerRef.current = window.setTimeout(() => {
+      closeTimerRef.current = null;
+      invoke("hide_overlay").catch(() => {});
+      setMode("select");
+      setOverlayClosing(false);
+      setSelectorClosing(false);
+      modeRef.current = "select";
+    }, 130);
   }, []);
 
   // Reset when overlay is re-shown
   useEffect(() => {
     const unlisten = listen("reset-overlay", () => {
+      if (closeTimerRef.current !== null) {
+        window.clearTimeout(closeTimerRef.current);
+        closeTimerRef.current = null;
+      }
       setMode("select");
+      setOverlayClosing(false);
+      setSelectorClosing(false);
       modeRef.current = "select";
       startPt.current = null;
       isDragging.current = false;
     });
     return () => { unlisten.then((fn) => fn()); };
   }, []);
+
+  useEffect(() => {
+    const unlisten = listen("close-overlay", () => {
+      close();
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, [close]);
 
   // Size canvas when entering crop mode
   useEffect(() => {
@@ -275,17 +312,19 @@ export default function Overlay() {
   }, [hideOverlayBeforeCapture, mode]);
 
   return (
-    <div className="fixed inset-0 w-full h-full overflow-hidden">
+    <motion.div
+      className="fixed inset-0 w-full h-full overflow-hidden"
+      animate={{ opacity: overlayClosing ? 0 : 1 }}
+      transition={{ opacity: { duration: 0.12, ease: "easeOut" } }}
+    >
       <canvas
         ref={canvasRef}
         className="fixed inset-0 w-full h-full"
         style={{ cursor: "crosshair", display: mode === "crop" ? "block" : "none" }}
       />
-      <AnimatePresence>
-        {mode === "select" && (
-          <ModeSelector onSelect={handleModeSelect} onClose={close} />
-        )}
-      </AnimatePresence>
-    </div>
+      {mode === "select" && (
+        <ModeSelector isClosing={selectorClosing} onSelect={handleModeSelect} onClose={close} />
+      )}
+    </motion.div>
   );
 }

@@ -394,7 +394,9 @@ pub fn show_overlay(app: &AppHandle) -> tauri::Result<()> {
                 // High bit set = key is currently held down
                 if GetAsyncKeyState(VK_ESCAPE) < 0 {
                     ESC_POLL.store(false, Ordering::Relaxed);
-                    hide_overlay_impl(&app_clone);
+                    if let Some(win) = app_clone.get_webview_window("overlay") {
+                        let _ = win.emit("close-overlay", ());
+                    }
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(16));
