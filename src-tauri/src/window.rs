@@ -8,7 +8,69 @@ use std::{
 };
 use tauri::{command, AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
-const THUMBNAIL_DISMISS_MS: u64 = 16_000;
+const THUMBNAIL_DISMISS_MS: u64 = 8_000;
+
+/// Toggle WDA_EXCLUDEFROMCAPTURE on every visible overlay/thumbnail/preview
+/// window so they remain visible to the user but are skipped by the system
+/// capture pipeline (BitBlt, PrintWindow, Windows.Graphics.Capture). Returns
+/// the labels that were excluded so the caller can restore them afterward.
+///
+/// Setting the affinity only for the duration of a capture — instead of
+/// permanently at window creation — avoids the DWM compositing artifacts that
+/// appear when a transparent webview is permanently marked excluded.
+pub fn hide_chrome_for_capture(app: &AppHandle) -> Vec<String> {
+    let mut toggled = Vec::new();
+    let mut candidates: Vec<String> =
+        (0..5).map(|index| format!("thumbnail-{index}")).collect();
+    candidates.push("preview-transition".to_string());
+
+    for label in candidates {
+        if let Some(win) = app.get_webview_window(&label) {
+            if win.is_visible().unwrap_or(false) {
+                if set_capture_affinity(&win, true) {
+                    toggled.push(label);
+                }
+            }
+        }
+    }
+
+    toggled
+}
+
+/// Restore WDA_NONE on every window previously excluded via
+/// `hide_chrome_for_capture`.
+pub fn restore_chrome_after_capture(app: &AppHandle, labels: Vec<String>) {
+    for label in labels {
+        if let Some(win) = app.get_webview_window(&label) {
+            set_capture_affinity(&win, false);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn set_capture_affinity(win: &tauri::WebviewWindow, exclude: bool) -> bool {
+    use windows::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{
+            SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+        },
+    };
+
+    let Ok(hwnd) = win.hwnd() else { return false };
+    let hwnd = HWND(hwnd.0 as _);
+    let affinity = if exclude { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+    unsafe { SetWindowDisplayAffinity(hwnd, affinity).is_ok() }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_capture_affinity(_win: &tauri::WebviewWindow, _exclude: bool) -> bool {
+    false
+}
+const THUMBNAIL_W: f64 = 300.0;
+const THUMBNAIL_H: f64 = 200.0;
+const PREVIEW_MAX_W: f64 = 920.0;
+const PREVIEW_MAX_H: f64 = 620.0;
+const PREVIEW_TRANSITION_MS: u32 = 360;
 
 /// Signals the Escape-polling thread to stop.
 static ESC_POLL: AtomicBool = AtomicBool::new(false);
@@ -18,6 +80,7 @@ static THUMBNAIL_PINNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static THUMBNAIL_POSITIONS: OnceLock<Mutex<HashMap<String, (f64, f64)>>> = OnceLock::new();
 static THUMBNAIL_TIMERS: OnceLock<Mutex<HashMap<String, ThumbnailTimer>>> = OnceLock::new();
 static THUMBNAIL_REFLOW_TOKEN: AtomicU64 = AtomicU64::new(0);
+static THUMBNAIL_PREVIEWING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
 struct ThumbnailTimer {
@@ -25,6 +88,29 @@ struct ThumbnailTimer {
     deadline: Instant,
     remaining: Duration,
     paused: bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct TransitionRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct PreviewTransitionPayload {
+    image: String,
+    source: TransitionRect,
+    target: TransitionRect,
+    #[serde(rename = "durationMs")]
+    duration_ms: u32,
+}
+
+#[derive(serde::Serialize)]
+pub struct PreviewTransitionStart {
+    #[serde(rename = "durationMs")]
+    duration_ms: u32,
 }
 
 fn thumbnail_hide_tokens() -> &'static Mutex<HashMap<String, u64>> {
@@ -45,6 +131,42 @@ fn thumbnail_positions() -> &'static Mutex<HashMap<String, (f64, f64)>> {
 
 fn thumbnail_timers() -> &'static Mutex<HashMap<String, ThumbnailTimer>> {
     THUMBNAIL_TIMERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn thumbnail_previewing() -> &'static Mutex<HashSet<String>> {
+    THUMBNAIL_PREVIEWING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn has_previewing_thumbnail() -> bool {
+    thumbnail_previewing()
+        .lock()
+        .map(|previewing| !previewing.is_empty())
+        .unwrap_or(false)
+}
+
+pub fn has_visible_preview_thumbnail(app: &AppHandle) -> bool {
+    let scale = app
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| monitor.scale_factor())
+        .unwrap_or(1.0);
+    let max_thumbnail_w = (THUMBNAIL_W + 24.0) * scale;
+    let max_thumbnail_h = (THUMBNAIL_H + 24.0) * scale;
+
+    (0..5).any(|index| {
+        let label = format!("thumbnail-{index}");
+        let Some(win) = app.get_webview_window(&label) else {
+            return false;
+        };
+        if !win.is_visible().unwrap_or(false) {
+            return false;
+        }
+        let Ok(size) = win.outer_size() else {
+            return false;
+        };
+        size.width as f64 > max_thumbnail_w || size.height as f64 > max_thumbnail_h
+    })
 }
 
 fn thumbnail_index_from_label(label: &str) -> Option<u32> {
@@ -98,6 +220,9 @@ fn mark_thumbnail_inactive(label: &str) -> bool {
     if let Ok(mut pinned) = thumbnail_pinned().lock() {
         pinned.remove(label);
     }
+    if let Ok(mut previewing) = thumbnail_previewing().lock() {
+        previewing.remove(label);
+    }
 
     if let Ok(mut active_order) = thumbnail_active_order().lock() {
         if let Some(index) = active_order.iter().position(|active| active == label) {
@@ -144,8 +269,50 @@ fn set_thumbnail_position(app: &AppHandle, label: &str, x: f64, y: f64) {
     record_thumbnail_position(label, x, y);
 }
 
+fn set_thumbnail_frame(app: &AppHandle, label: &str, x: f64, y: f64, w: f64, h: f64) {
+    if let Some(win) = app.get_webview_window(label) {
+        let _ = win.set_position(tauri::Position::Logical(tauri::LogicalPosition { x, y }));
+        let _ = win.set_size(tauri::Size::Logical(tauri::LogicalSize {
+            width: w,
+            height: h,
+        }));
+    }
+    record_thumbnail_position(label, x, y);
+}
+
 fn ease_out_cubic(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
     1.0 - (1.0 - t).powi(3)
+}
+
+fn animate_thumbnail_frame(
+    app: AppHandle,
+    label: String,
+    start: (f64, f64, f64, f64),
+    target: (f64, f64, f64, f64),
+) {
+    std::thread::spawn(move || {
+        let duration = Duration::from_millis(280);
+        let started = Instant::now();
+
+        loop {
+            let elapsed = started.elapsed();
+            let t = ease_out_cubic(elapsed.as_secs_f64() / duration.as_secs_f64());
+            let x = start.0 + ((target.0 - start.0) * t);
+            let y = start.1 + ((target.1 - start.1) * t);
+            let w = start.2 + ((target.2 - start.2) * t);
+            let h = start.3 + ((target.3 - start.3) * t);
+            set_thumbnail_frame(&app, &label, x, y, w, h);
+
+            if elapsed >= duration {
+                break;
+            }
+
+            std::thread::sleep(Duration::from_millis(8));
+        }
+
+        set_thumbnail_frame(&app, &label, target.0, target.1, target.2, target.3);
+    });
 }
 
 fn reflow_thumbnails(app: &AppHandle, animate: bool) {
@@ -160,6 +327,17 @@ fn reflow_thumbnails(app: &AppHandle, animate: bool) {
         })
         .collect::<Vec<_>>();
 
+    // Tell every active thumbnail: "you are about to be moved, ignore the
+    // next synthetic mouseenter/mouseleave for a short window." Without this
+    // the browser fires a fake hover event whenever a thumbnail's window
+    // slides under (or out from under) a stationary cursor, which freezes
+    // the timer on a thumbnail the user never actually interacted with.
+    if let Some(first) = labels.first() {
+        if let Some(win) = app.get_webview_window(first) {
+            let _ = win.emit("liem-thumbnail-reflow", ());
+        }
+    }
+
     let token = THUMBNAIL_REFLOW_TOKEN.fetch_add(1, Ordering::Relaxed) + 1;
 
     if !animate {
@@ -171,14 +349,16 @@ fn reflow_thumbnails(app: &AppHandle, animate: bool) {
 
     let app = app.clone();
     std::thread::spawn(move || {
-        let frames = 12;
+        let duration = Duration::from_millis(240);
+        let started = Instant::now();
 
-        for frame in 1..=frames {
+        loop {
             if THUMBNAIL_REFLOW_TOKEN.load(Ordering::Relaxed) != token {
                 return;
             }
 
-            let t = ease_out_cubic(frame as f64 / frames as f64);
+            let elapsed = started.elapsed();
+            let t = ease_out_cubic(elapsed.as_secs_f64() / duration.as_secs_f64());
 
             for (label, (sx, sy), (tx, ty)) in &targets {
                 let x = sx + ((tx - sx) * t);
@@ -186,13 +366,42 @@ fn reflow_thumbnails(app: &AppHandle, animate: bool) {
                 set_thumbnail_position(&app, label, x, y);
             }
 
-            std::thread::sleep(Duration::from_millis(12));
+            if elapsed >= duration {
+                break;
+            }
+
+            std::thread::sleep(Duration::from_millis(8));
         }
 
         for (label, _, (x, y)) in targets {
             set_thumbnail_position(&app, &label, x, y);
         }
     });
+}
+
+fn raise_active_thumbnails(app: &AppHandle) {
+    for label in active_thumbnail_labels() {
+        if let Some(win) = app.get_webview_window(&label) {
+            let _ = win.set_always_on_top(true);
+            let _ = win.show();
+            #[cfg(target_os = "windows")]
+            {
+                use windows::Win32::{
+                    Foundation::HWND,
+                    UI::WindowsAndMessaging::{
+                        SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+                        SWP_SHOWWINDOW,
+                    },
+                };
+
+                if let Ok(hwnd) = win.hwnd() {
+                    let hwnd = HWND(hwnd.0 as _);
+                    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+                    let _ = unsafe { SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags) };
+                }
+            }
+        }
+    }
 }
 
 fn start_thumbnail_timer(label: &str, token: u64) {
@@ -261,8 +470,17 @@ pub fn pause_thumbnail_timers(app: &AppHandle) {
 }
 
 pub fn resume_thumbnail_timers(app: &AppHandle) {
+    if has_previewing_thumbnail() {
+        return;
+    }
+
     let labels = active_thumbnail_labels();
     let now = Instant::now();
+    // Collect each label's authoritative remaining ms so we can ship it as
+    // the event payload — JS uses this instead of guessing from its own clock,
+    // which avoids drift if the IPC event lands later than the new thumbnail's
+    // eval (the cause of "B finishes before A" when both are in flight).
+    let mut payloads: HashMap<String, u64> = HashMap::new();
 
     if let Ok(mut timers) = thumbnail_timers().lock() {
         for label in &labels {
@@ -271,13 +489,18 @@ pub fn resume_thumbnail_timers(app: &AppHandle) {
                     timer.deadline = now + timer.remaining;
                     timer.paused = false;
                 }
+                payloads.insert(
+                    label.clone(),
+                    timer.deadline.saturating_duration_since(now).as_millis() as u64,
+                );
             }
         }
     }
 
     for label in labels {
         if let Some(win) = app.get_webview_window(&label) {
-            let _ = win.emit("liem-thumbnail-resume", ());
+            let remaining = payloads.get(&label).copied();
+            let _ = win.emit("liem-thumbnail-resume", remaining);
         }
     }
 }
@@ -319,7 +542,7 @@ pub fn create_overlay(app: &AppHandle) -> tauri::Result<()> {
     };
 
     WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("/#/overlay".into()))
-        .title("Liem Shot — Overlay")
+        .title("Liem Shot Overlay")
         .inner_size(w, h)
         .position(mx, my)
         .decorations(false)
@@ -332,6 +555,107 @@ pub fn create_overlay(app: &AppHandle) -> tauri::Result<()> {
         .focused(false)
         .disable_drag_drop_handler()
         .build()?;
+
+    Ok(())
+}
+
+const DRAG_CANCEL_W: f64 = 380.0;
+const DRAG_CANCEL_H: f64 = 110.0;
+const DRAG_CANCEL_BOTTOM_MARGIN: f64 = 56.0;
+
+fn drag_cancel_position(app: &AppHandle) -> tauri::Result<(f64, f64)> {
+    let (sw, sh, mx, my) = overlay_bounds(app)?;
+    let x = mx + ((sw - DRAG_CANCEL_W) / 2.0);
+    let y = my + sh - DRAG_CANCEL_H - DRAG_CANCEL_BOTTOM_MARGIN;
+    Ok((x, y))
+}
+
+pub fn create_drag_cancel(app: &AppHandle) -> tauri::Result<()> {
+    if app.get_webview_window("drag-cancel").is_some() {
+        return Ok(());
+    }
+
+    // A small always-on-top click-through window centered at the bottom of
+    // the primary monitor. Shows a "Drop here to cancel" pill while a
+    // gallery drag is active. It is intentionally pointer-events: none so
+    // it never accepts the drop itself — dropping on it (or anywhere not
+    // handled by a real app) is treated as a cancel by the OS, and we then
+    // re-show the selector overlay.
+    let (x, y) = drag_cancel_position(app)?;
+    WebviewWindowBuilder::new(app, "drag-cancel", WebviewUrl::App("drag-cancel.html".into()))
+        .title("")
+        .inner_size(DRAG_CANCEL_W, DRAG_CANCEL_H)
+        .position(x, y)
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .visible(false)
+        .focused(false)
+        .disable_drag_drop_handler()
+        .build()?;
+
+    Ok(())
+}
+
+#[command]
+pub fn show_drag_cancel_target(app: AppHandle) -> Result<(), String> {
+    create_drag_cancel(&app).map_err(|e| e.to_string())?;
+    if let Some(win) = app.get_webview_window("drag-cancel") {
+        // Re-anchor at center-bottom of the primary monitor in case the
+        // monitor layout changed since the window was created.
+        if let Ok((x, y)) = drag_cancel_position(&app) {
+            let _ = win.set_size(tauri::Size::Logical(tauri::LogicalSize {
+                width: DRAG_CANCEL_W,
+                height: DRAG_CANCEL_H,
+            }));
+            let _ = win.set_position(tauri::Position::Logical(tauri::LogicalPosition { x, y }));
+        }
+        win.show().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[command]
+pub fn hide_drag_cancel_target(app: AppHandle) {
+    if let Some(win) = app.get_webview_window("drag-cancel") {
+        let _ = win.hide();
+    }
+}
+
+/// Command wrapper around `show_overlay`. Used by the gallery drag flow to
+/// bring the selector back when a drag is cancelled.
+#[command]
+pub fn show_overlay_again(app: AppHandle) -> Result<(), String> {
+    show_overlay(&app).map_err(|e| e.to_string())
+}
+
+pub fn create_preview_transition(app: &AppHandle) -> tauri::Result<()> {
+    if app.get_webview_window("preview-transition").is_some() {
+        return Ok(());
+    }
+
+    let (w, h, mx, my) = overlay_bounds(app)?;
+    WebviewWindowBuilder::new(
+        app,
+        "preview-transition",
+        WebviewUrl::App("preview-transition.html".into()),
+    )
+    .title("")
+    .inner_size(w, h)
+    .position(mx, my)
+    .decorations(false)
+    .transparent(true)
+    .shadow(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(false)
+    .visible(false)
+    .focused(false)
+    .disable_drag_drop_handler()
+    .build()?;
 
     Ok(())
 }
@@ -356,6 +680,15 @@ fn overlay_bounds(app: &AppHandle) -> tauri::Result<(f64, f64, f64, f64)> {
 pub fn show_overlay(app: &AppHandle) -> tauri::Result<()> {
     use tauri::Emitter;
 
+    if thumbnail_previewing()
+        .lock()
+        .map(|previewing| !previewing.is_empty())
+        .unwrap_or(false)
+        || has_visible_preview_thumbnail(app)
+    {
+        return Ok(());
+    }
+
     let win = match app.get_webview_window("overlay") {
         Some(w) => w,
         None => {
@@ -378,6 +711,7 @@ pub fn show_overlay(app: &AppHandle) -> tauri::Result<()> {
     win.show()?;
     win.set_focus()?;
     let _ = win.emit("reset-overlay", ());
+    raise_active_thumbnails(app);
     pause_thumbnail_timers(app);
 
     // Spawn a lightweight polling thread to detect Escape without needing a
@@ -407,18 +741,25 @@ pub fn show_overlay(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-fn hide_overlay_impl(app: &AppHandle) {
+fn hide_overlay_impl(app: &AppHandle, resume_timers: bool) {
     ESC_POLL.store(false, Ordering::Relaxed);
     if let Some(win) = app.get_webview_window("overlay") {
         let _ = win.hide();
     }
-    resume_thumbnail_timers(app);
+    if resume_timers {
+        resume_thumbnail_timers(app);
+    }
 }
 
 /// Called from JS after crop selection or mode cancel.
 #[command]
 pub fn hide_overlay(app: AppHandle) {
-    hide_overlay_impl(&app);
+    hide_overlay_impl(&app, true);
+}
+
+#[command]
+pub fn hide_overlay_for_capture(app: AppHandle) {
+    hide_overlay_impl(&app, false);
 }
 
 fn hide_thumbnail_impl(app: &AppHandle, label: &str) {
@@ -436,6 +777,207 @@ fn hide_thumbnail_impl(app: &AppHandle, label: &str) {
 pub fn hide_thumbnail(app: AppHandle, label: String) {
     let _ = next_thumbnail_hide_token(&label);
     hide_thumbnail_impl(&app, &label);
+}
+
+#[command]
+pub fn set_thumbnail_preview_mode(app: AppHandle, label: String, active: bool) {
+    let should_resume = thumbnail_previewing()
+        .lock()
+        .map(|mut previewing| {
+            if active {
+                previewing.insert(label);
+                false
+            } else {
+                previewing.remove(&label);
+                previewing.is_empty()
+            }
+        })
+        .unwrap_or(!active);
+
+    if active {
+        pause_thumbnail_timers(&app);
+    } else if should_resume {
+        resume_thumbnail_timers(&app);
+    }
+}
+
+#[command]
+pub fn start_window_drag(app: AppHandle, label: String) -> Result<(), String> {
+    let win = app
+        .get_webview_window(&label)
+        .ok_or_else(|| format!("Window not found: {label}"))?;
+    win.start_dragging().map_err(|e| e.to_string())
+}
+
+#[command]
+pub fn move_thumbnail_window_by(
+    app: AppHandle,
+    label: String,
+    delta_x: f64,
+    delta_y: f64,
+) -> Result<(), String> {
+    let (x, y) = remembered_thumbnail_position(&label).unwrap_or((40.0, 40.0));
+    set_thumbnail_position(&app, &label, x + delta_x, y + delta_y);
+    Ok(())
+}
+
+#[command]
+pub fn start_thumbnail_preview_transition(
+    app: AppHandle,
+    label: String,
+    image: String,
+) -> Result<PreviewTransitionStart, String> {
+    create_preview_transition(&app).map_err(|e| e.to_string())?;
+
+    let monitor = app
+        .primary_monitor()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No primary monitor found".to_string())?;
+    let scale = monitor.scale_factor();
+    let sw = monitor.size().width as f64 / scale;
+    let sh = monitor.size().height as f64 / scale;
+    let mx = monitor.position().x as f64 / scale;
+    let my = monitor.position().y as f64 / scale;
+    let w = PREVIEW_MAX_W.min(sw - 96.0).max(THUMBNAIL_W);
+    let h = PREVIEW_MAX_H.min(sh - 96.0).max(THUMBNAIL_H);
+    let tx = mx + ((sw - w) / 2.0);
+    let ty = my + ((sh - h) / 2.0);
+
+    let (sx, sy, source_w, source_h) = app
+        .get_webview_window(&label)
+        .and_then(|win| {
+            let pos = win.outer_position().ok()?;
+            let size = win.outer_size().ok()?;
+            Some((
+                pos.x as f64 / scale,
+                pos.y as f64 / scale,
+                size.width as f64 / scale,
+                size.height as f64 / scale,
+            ))
+        })
+        .unwrap_or_else(|| {
+            let (x, y) = remembered_thumbnail_position(&label).unwrap_or((mx + sw, my + sh));
+            (x, y, THUMBNAIL_W, THUMBNAIL_H)
+        });
+
+    let transition = app
+        .get_webview_window("preview-transition")
+        .ok_or_else(|| "Preview transition window unavailable".to_string())?;
+
+    let _ = transition.set_position(tauri::Position::Logical(tauri::LogicalPosition {
+        x: mx,
+        y: my,
+    }));
+    let _ = transition.set_size(tauri::Size::Logical(tauri::LogicalSize {
+        width: sw,
+        height: sh,
+    }));
+    if let Some(win) = app.get_webview_window(&label) {
+        let _ = win.eval("window.__LIEM_CONCEAL_THUMBNAIL && window.__LIEM_CONCEAL_THUMBNAIL();");
+    }
+    transition.show().map_err(|e| e.to_string())?;
+    let _ = transition.emit(
+        "liem-preview-transition",
+        PreviewTransitionPayload {
+            image,
+            source: TransitionRect {
+                x: sx - mx,
+                y: sy - my,
+                w: source_w,
+                h: source_h,
+            },
+            target: TransitionRect {
+                x: tx - mx,
+                y: ty - my,
+                w,
+                h,
+            },
+            duration_ms: PREVIEW_TRANSITION_MS,
+        },
+    );
+
+    Ok(PreviewTransitionStart {
+        duration_ms: PREVIEW_TRANSITION_MS,
+    })
+}
+
+#[command]
+pub fn hide_preview_transition(app: AppHandle) {
+    if let Some(win) = app.get_webview_window("preview-transition") {
+        let _ = win.emit("liem-preview-transition-hide", ());
+        let win = win.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = win.hide();
+        });
+    }
+}
+
+#[command]
+pub fn expand_thumbnail_preview(app: AppHandle, label: String) -> Result<(), String> {
+    let monitor = app
+        .primary_monitor()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No primary monitor found".to_string())?;
+    let scale = monitor.scale_factor();
+    let sw = monitor.size().width as f64 / scale;
+    let sh = monitor.size().height as f64 / scale;
+    let mx = monitor.position().x as f64 / scale;
+    let my = monitor.position().y as f64 / scale;
+    let w = PREVIEW_MAX_W.min(sw - 96.0).max(THUMBNAIL_W);
+    let h = PREVIEW_MAX_H.min(sh - 96.0).max(THUMBNAIL_H);
+    let tx = mx + ((sw - w) / 2.0);
+    let ty = my + ((sh - h) / 2.0);
+
+    cancel_thumbnail_timer(&label);
+    set_thumbnail_frame(&app, &label, tx, ty, w, h);
+    Ok(())
+}
+
+#[command]
+pub fn collapse_thumbnail_preview(app: AppHandle, label: String, remaining_ms: u64) {
+    let stack_index = thumbnail_stack_index(&label)
+        .unwrap_or_else(|| thumbnail_index_from_label(&label).unwrap_or(0));
+    let target = thumbnail_position(&app, stack_index).unwrap_or((40.0, 40.0));
+
+    if let Some(win) = app.get_webview_window(&label) {
+        let Ok(pos) = win.outer_position() else {
+            set_thumbnail_frame(&app, &label, target.0, target.1, THUMBNAIL_W, THUMBNAIL_H);
+            return;
+        };
+        let Ok(size) = win.outer_size() else {
+            set_thumbnail_frame(&app, &label, target.0, target.1, THUMBNAIL_W, THUMBNAIL_H);
+            return;
+        };
+
+        let scale = app
+            .primary_monitor()
+            .ok()
+            .flatten()
+            .map(|m| m.scale_factor())
+            .unwrap_or(1.0);
+        let sx = pos.x as f64 / scale;
+        let sy = pos.y as f64 / scale;
+        let sw = size.width as f64 / scale;
+        let sh = size.height as f64 / scale;
+        animate_thumbnail_frame(
+            app.clone(),
+            label.clone(),
+            (sx, sy, sw, sh),
+            (target.0, target.1, THUMBNAIL_W, THUMBNAIL_H),
+        );
+    }
+
+    record_thumbnail_position(&label, target.0, target.1);
+    if !is_thumbnail_pinned(&label) {
+        let token = next_thumbnail_hide_token(&label);
+        start_thumbnail_timer_for(
+            &label,
+            token,
+            Duration::from_millis(remaining_ms.clamp(1, THUMBNAIL_DISMISS_MS)),
+        );
+        schedule_thumbnail_hide(&app, &label, token);
+    }
 }
 
 #[command]
@@ -480,6 +1022,23 @@ fn schedule_thumbnail_hide(app: &AppHandle, label: &str, token: u64) {
                 let remaining = timer.deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     drop(timers);
+                    // Delegate to JS so the dismiss animation plays. JS then
+                    // invokes `hide_thumbnail`, which performs the native
+                    // window.hide() and final cleanup. We cancel the timer
+                    // here so this thread does not loop again before JS
+                    // responds. If the window is missing (JS dead/unloaded)
+                    // we still fall back to a direct hide.
+                    cancel_thumbnail_timer(&label);
+                    if let Some(win) = app.get_webview_window(&label) {
+                        // emit() in Tauri v2 broadcasts to every webview, so
+                        // include the label in the payload and let each
+                        // thumbnail's JS filter by `currentWindow.label`.
+                        // Otherwise every thumbnail dismisses together when
+                        // any one of them times out.
+                        if win.emit("liem-thumbnail-auto-dismiss", &label).is_ok() {
+                            return;
+                        }
+                    }
                     hide_thumbnail_impl(&app, &label);
                     return;
                 }
@@ -506,12 +1065,10 @@ fn thumbnail_position(app: &AppHandle, index: u32) -> tauri::Result<(f64, f64)> 
             let sh = monitor.size().height as f64 / scale;
             let margin = 20.0;
             let taskbar_clearance = 28.0;
-            let thumb_w = 300.0;
-            let thumb_h = 200.0;
-            let stack_offset = (index as f64) * (thumb_h + 8.0);
+            let stack_offset = (index as f64) * (THUMBNAIL_H + 8.0);
             (
-                sw - thumb_w - margin,
-                sh - thumb_h - margin - taskbar_clearance - stack_offset,
+                sw - THUMBNAIL_W - margin,
+                sh - THUMBNAIL_H - margin - taskbar_clearance - stack_offset,
             )
         }
         None => (40.0, 40.0),
@@ -533,10 +1090,11 @@ fn ensure_thumbnail(app: &AppHandle, index: u32) -> tauri::Result<()> {
 
     let _win = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
         .title("")
-        .inner_size(300.0, 200.0)
+        .inner_size(THUMBNAIL_W, THUMBNAIL_H)
         .position(x, y)
         .decorations(false)
         .transparent(true)
+        .shadow(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .resizable(false)
@@ -567,20 +1125,59 @@ pub fn show_thumbnail(
     let (x, y) = thumbnail_position(app, stack_index)?;
 
     mark_thumbnail_active(&label);
-    set_thumbnail_position(app, &label, x, y);
+    let _ = win.eval("window.__LIEM_PREPARE_THUMBNAIL && window.__LIEM_PREPARE_THUMBNAIL();");
+    set_thumbnail_frame(app, &label, x, y, THUMBNAIL_W, THUMBNAIL_H);
     let _ = win.emit("liem-thumbnail-data", payload);
     if let Ok(payload_json) = serde_json::to_string(payload) {
         let script =
             format!("window.__LIEM_SET_THUMBNAIL && window.__LIEM_SET_THUMBNAIL({payload_json});");
         let _ = win.eval(&script);
     }
+    reflow_thumbnails(app, false);
     win.show()?;
+    set_thumbnail_frame(app, &label, x, y, THUMBNAIL_W, THUMBNAIL_H);
+    let _ = win.eval("window.__LIEM_REVEAL_THUMBNAIL && window.__LIEM_REVEAL_THUMBNAIL();");
     if !is_thumbnail_pinned(&label) {
         let token = next_thumbnail_hide_token(&label);
         start_thumbnail_timer(&label, token);
         schedule_thumbnail_hide(app, &label, token);
     }
-    reflow_thumbnails(app, true);
+
+    // Immediately resume any sibling thumbnails that were paused while the
+    // overlay was open. Doing this here (instead of waiting for the
+    // ThumbnailTimerPause Drop or for JS to round-trip via
+    // set_thumbnail_preview_mode) puts the resume emit on the same code path
+    // as the new thumbnail's eval, so the events land at the receiving JS
+    // contexts within microseconds of each other and their bars stay in sync.
+    resume_thumbnail_timers(app);
 
     Ok(())
+}
+
+/// Hover-pause: stop a single thumbnail's auto-dismiss countdown without
+/// touching any other thumbnails. Called when the user mouses over the
+/// thumbnail. The JS caller already updated its local progress bar, so we
+/// must NOT emit a pause event back — that would cause a double-update and
+/// desync the bar from the actual hide moment.
+#[command]
+pub fn pause_thumbnail_lifetime(label: String) {
+    if is_thumbnail_pinned(&label) {
+        return;
+    }
+    let _ = next_thumbnail_hide_token(&label);
+    cancel_thumbnail_timer(&label);
+}
+
+/// Hover-leave: restart a single thumbnail's auto-dismiss countdown at the
+/// full lifetime. As with `pause_thumbnail_lifetime`, the JS caller already
+/// reset its local bar; emitting a restart event here would re-zero the bar
+/// a few ms later and produce a visible jitter / desync.
+#[command]
+pub fn restart_thumbnail_lifetime(app: AppHandle, label: String) {
+    if is_thumbnail_pinned(&label) {
+        return;
+    }
+    let token = next_thumbnail_hide_token(&label);
+    start_thumbnail_timer(&label, token);
+    schedule_thumbnail_hide(&app, &label, token);
 }

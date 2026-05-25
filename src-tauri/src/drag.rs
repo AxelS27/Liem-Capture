@@ -1,8 +1,11 @@
 use std::sync::mpsc;
 use tauri::{command, AppHandle};
 
+/// Result of a drag operation. `true` means the user actually dropped onto a
+/// target (Discord, Explorer, a browser…); `false` means the drag was
+/// cancelled (Esc, drop on empty area, drop on a non-accepting window).
 #[command]
-pub fn start_drag(app: AppHandle, path: String) -> Result<(), String> {
+pub fn start_drag(app: AppHandle, path: String) -> Result<bool, String> {
     #[cfg(target_os = "windows")]
     {
         let (tx, rx) = mpsc::channel();
@@ -11,16 +14,21 @@ pub fn start_drag(app: AppHandle, path: String) -> Result<(), String> {
         })
         .map_err(|e| e.to_string())?;
 
-        rx.recv()
+        return rx
+            .recv()
             .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string());
     }
 
-    Ok(())
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, path);
+        Ok(false)
+    }
 }
 
 #[cfg(target_os = "windows")]
-fn windows_drag(path: &str) -> Result<(), String> {
+fn windows_drag(path: &str) -> Result<bool, String> {
     if !std::path::Path::new(path).is_file() {
         return Err(format!("Drag source file not found: {path}"));
     }
@@ -274,12 +282,25 @@ fn windows_drag(path: &str) -> Result<(), String> {
         let source = IDropSource::from(FileDropSource);
         let mut effect = DROPEFFECT(0);
 
-        let result = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect).ok();
+        let hr = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
 
         if ole_initialized {
             OleUninitialize();
         }
 
-        result.map(|_| ()).map_err(|e| e.to_string())
+        // DoDragDrop returns either DRAGDROP_S_DROP (dropped onto a target)
+        // or DRAGDROP_S_CANCEL (user cancelled). Both are SUCCESS HRESULTs
+        // so `.ok()` collapses the two — we have to compare the raw code
+        // ourselves to tell the caller whether the file actually landed.
+        if hr == DRAGDROP_S_DROP {
+            Ok(true)
+        } else if hr == DRAGDROP_S_CANCEL {
+            Ok(false)
+        } else if hr.is_ok() {
+            // Unexpected success HRESULT — treat as cancel to be safe.
+            Ok(false)
+        } else {
+            Err(format!("DoDragDrop failed: 0x{:08x}", hr.0 as u32))
+        }
     }
 }

@@ -9,6 +9,9 @@ pub fn register_shortcuts(app: &AppHandle) -> Result<(), Box<dyn std::error::Err
     let app_handle = app.clone();
     app.global_shortcut()
         .on_shortcut(shortcut, move |_app, _shortcut, _event| {
+            if window::has_visible_preview_thumbnail(&app_handle) {
+                return;
+            }
             if let Err(e) = window::show_overlay(&app_handle) {
                 eprintln!("Failed to show overlay: {e}");
             }

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Liem Shot Preview Transition</title>
+    <style>
+      * {
+        box-sizing: border-box;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: transparent;
+      }
+
+      #ghost {
+        position: absolute;
+        left: 0;
+        top: 0;
+        display: none;
+        object-fit: contain;
+        background: rgb(15, 15, 18);
+        pointer-events: none;
+        -webkit-user-drag: none;
+        transform-origin: 0 0;
+        will-change: transform, border-radius, opacity;
+      }
+    </style>
+  </head>
+  <body>
+    <img id="ghost" alt="" draggable="false" />
+    <script type="module" src="/src/preview-transition.ts"></script>
+  </body>
+</html>

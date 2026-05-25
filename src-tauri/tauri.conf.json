@@ -30,7 +30,7 @@
     "trayIcon": {
       "id": "main",
       "iconPath": "icons/icon.ico",
-      "tooltip": "Liem Shot — Capture. Drag. Done.",
+      "tooltip": "Liem Shot. Capture. Drag. Done.",
       "iconAsTemplate": false
     }
   },

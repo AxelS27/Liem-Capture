@@ -13,6 +13,8 @@ export default defineConfig(async () => ({
       input: {
         main: "index.html",
         thumbnail: "thumbnail.html",
+        previewTransition: "preview-transition.html",
+        dragCancel: "drag-cancel.html",
       },
     },
   },
