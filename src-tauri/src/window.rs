@@ -582,7 +582,7 @@ pub fn create_drag_cancel(app: &AppHandle) -> tauri::Result<()> {
     // handled by a real app) is treated as a cancel by the OS, and we then
     // re-show the selector overlay.
     let (x, y) = drag_cancel_position(app)?;
-    WebviewWindowBuilder::new(app, "drag-cancel", WebviewUrl::App("drag-cancel.html".into()))
+    WebviewWindowBuilder::new(app, "drag-cancel", WebviewUrl::App("windows/drag-cancel.html".into()))
         .title("")
         .inner_size(DRAG_CANCEL_W, DRAG_CANCEL_H)
         .position(x, y)
@@ -641,7 +641,7 @@ pub fn create_preview_transition(app: &AppHandle) -> tauri::Result<()> {
     WebviewWindowBuilder::new(
         app,
         "preview-transition",
-        WebviewUrl::App("preview-transition.html".into()),
+        WebviewUrl::App("windows/preview-transition.html".into()),
     )
     .title("")
     .inner_size(w, h)
@@ -1084,7 +1084,7 @@ fn ensure_thumbnail(app: &AppHandle, index: u32) -> tauri::Result<()> {
         return Ok(());
     }
 
-    let url = "thumbnail.html";
+    let url = "windows/thumbnail.html";
     let (x, y) = thumbnail_position(app, index)?;
     record_thumbnail_position(&label, x, y);
 

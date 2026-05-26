@@ -12,9 +12,9 @@ export default defineConfig(async () => ({
     rollupOptions: {
       input: {
         main: "index.html",
-        thumbnail: "thumbnail.html",
-        previewTransition: "preview-transition.html",
-        dragCancel: "drag-cancel.html",
+        thumbnail: "windows/thumbnail.html",
+        previewTransition: "windows/preview-transition.html",
+        dragCancel: "windows/drag-cancel.html",
       },
     },
   },
