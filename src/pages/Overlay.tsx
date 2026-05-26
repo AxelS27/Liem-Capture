@@ -21,7 +21,7 @@ interface Rect  { x: number; y: number; w: number; h: number }
 
 const SHOT_SFX_OFFSET_SECONDS = 0;
 const OVERLAY_CLOSE_MS = 130;
-const GALLERY_PREVIEW_LOADING_KEY = "liem-shot:gallery-preview-loading";
+const GALLERY_PREVIEW_LOADING_KEY = "liem-capture:gallery-preview-loading";
 const shotSfx = new Audio("/sfx/shot_sfx.mp3");
 shotSfx.preload = "auto";
 shotSfx.volume = 0.62;
@@ -154,7 +154,7 @@ function formatDateTime(ms: number): string {
   }
 }
 
-const ROOT_LABEL = "Liem Shot";
+const ROOT_LABEL = "Liem Capture";
 const DRAG_THRESHOLD_PX = 5;
 
 // Shared between the inline ImageViewer and the Overlay's global keydown
@@ -526,6 +526,7 @@ function GalleryTile({
           : "border-white/15 hover:border-white/50",
       ].join(" ")}
       title={item.name}
+      data-gallery-path={item.path}
     >
       {previewB64 ? (
         <img
@@ -591,6 +592,7 @@ function GallerySection({
   const previewsRef = useRef<Record<string, string>>({});
   const hasItemsRef = useRef(false);
   const containerRef = useRef<HTMLDivElement>(null);
+  const gridRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     previewsRef.current = previews;
@@ -931,7 +933,22 @@ function GallerySection({
     };
   }, [cleanupDrag, currentPath, launchExternalDrag, refreshItems, refreshTree, requestMetadata, viewImage]);
 
-  // Keyboard shortcuts: F2 = rename, Delete = delete. Targets the
+  const moveGallerySelection = useCallback((delta: number) => {
+    if (items.length === 0) return;
+    const currentIndex = selectedPath
+      ? items.findIndex((item) => item.path === selectedPath)
+      : -1;
+    const baseIndex = currentIndex === -1 ? 0 : currentIndex;
+    const nextIndex = Math.max(0, Math.min(items.length - 1, baseIndex + delta));
+    const next = items[nextIndex];
+    if (!next) return;
+    setSelectedPath(next.path);
+    requestPreview(next.path);
+    requestMetadata(next.path);
+  }, [items, requestMetadata, requestPreview, selectedPath]);
+
+  // Keyboard shortcuts and navigation. Arrow keys move the selected tile
+  // in the 3-column grid, Enter opens it, F2 renames, Delete removes it.
   // selected screenshot if any; otherwise falls back to the currently
   // browsed folder (so users can rename / delete the folder they're in
   // without having to right-click in the tree). Suppressed while a
@@ -942,10 +959,27 @@ function GallerySection({
       if (viewerOpenRef.current || dialogOpenRef.current) return;
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
-      if (e.key !== "F2" && e.key !== "Delete") return;
+      const isArrow = e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "ArrowUp" || e.key === "ArrowDown";
+      if (!isArrow && e.key !== "Enter" && e.key !== "F2" && e.key !== "Delete") return;
 
       e.preventDefault();
       e.stopPropagation();
+
+      if (isArrow) {
+        const delta =
+          e.key === "ArrowLeft" ? -1 :
+          e.key === "ArrowRight" ? 1 :
+          e.key === "ArrowUp" ? -3 :
+          3;
+        moveGallerySelection(delta);
+        return;
+      }
+
+      if (e.key === "Enter") {
+        const item = selectedPath ? items.find((i) => i.path === selectedPath) : items[0];
+        if (item) viewImage(item);
+        return;
+      }
 
       if (e.key === "F2") {
         if (selectedPath) {
@@ -976,7 +1010,7 @@ function GallerySection({
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [currentPath, dialog, handleDeleteFolder, handleRenameFolder, handleRenameItem, items, selectedPath, tree]);
+  }, [currentPath, dialog, handleDeleteFolder, handleRenameFolder, handleRenameItem, items, moveGallerySelection, selectedPath, tree, viewImage]);
 
   // Keep the info panel useful as soon as the gallery opens: select the
   // first visible item by default, and move to the next item after deletes.
@@ -994,6 +1028,9 @@ function GallerySection({
     if (!selectedPath) return;
     requestPreview(selectedPath);
     requestMetadata(selectedPath);
+    gridRef.current
+      ?.querySelector<HTMLElement>(`[data-gallery-path="${CSS.escape(selectedPath)}"]`)
+      ?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [requestMetadata, requestPreview, selectedPath]);
 
   const selectedMetadata = selectedPath ? metadataCache[selectedPath] : undefined;
@@ -1012,7 +1049,7 @@ function GallerySection({
     <div ref={containerRef} className="flex" style={{ minHeight: 440 }}>
       {/* Folder tree sidebar */}
       <div className="w-56 shrink-0 border-r border-white/12 flex flex-col" style={{ maxHeight: 520 }}>
-        <div className="flex-1 overflow-y-auto px-1 py-2">
+        <div className="liem-scrollbar flex-1 overflow-y-auto px-1 py-2">
           {tree ? (
             <FolderTreeNode
               node={tree}
@@ -1053,7 +1090,8 @@ function GallerySection({
             </div>
           ) : (
             <div
-              className="grid grid-cols-3 gap-2.5 overflow-y-auto pr-1"
+              ref={gridRef}
+              className="liem-scrollbar grid grid-cols-[repeat(3,minmax(0,1fr))] auto-rows-max gap-2.5 overflow-y-auto pr-1.5"
               style={{ maxHeight: 420 }}
             >
               {items.map((item) => (
@@ -1082,7 +1120,7 @@ function GallerySection({
           <div className="flex items-center justify-between gap-2 px-3 pt-2.5 pb-1.5">
             <span className="text-white/85 text-xs font-semibold tracking-tight">Info</span>
           </div>
-          <div className="px-3 pb-3 flex-1 overflow-y-auto flex flex-col gap-3">
+          <div className="liem-scrollbar px-3 pb-3 flex-1 overflow-y-auto flex flex-col gap-3">
             {/* Preview */}
             <div className="aspect-[3/2] rounded-lg overflow-hidden border border-white/15 bg-black/40">
               {previews[selectedPath] ? (
@@ -1413,13 +1451,18 @@ const SELECTOR_SURFACE_STYLE = {
 } as const;
 
 const SELECTOR_BUTTON_CLASS =
-  "h-16 flex items-center gap-3 px-3 rounded-lg text-left transition-all border border-white/[0.08] bg-zinc-900/80 hover:bg-zinc-800/95 hover:border-white/28 hover:shadow-[0_0_0_1px_rgba(255,255,255,0.08)] active:bg-zinc-700/90";
+  "h-16 flex items-center gap-3 px-3 rounded-lg text-left transition-all border border-white/[0.08] bg-zinc-900/80 hover:bg-zinc-800/95 hover:border-white/28 hover:shadow-[0_0_0_1px_rgba(255,255,255,0.08)] active:bg-zinc-700/90 focus:outline-none";
 
 const SELECTOR_ACTION_CLASS =
-  "min-h-64 flex flex-col items-center justify-center gap-5 p-5 rounded-lg text-center transition-all border border-white/[0.08] bg-zinc-900/80 hover:bg-zinc-800/95 hover:border-white/28 active:bg-zinc-700/90";
+  "min-h-64 flex flex-col items-center justify-center gap-5 p-5 rounded-lg text-center transition-all border border-white/[0.08] bg-zinc-900/80 hover:bg-zinc-800/95 hover:border-white/28 active:bg-zinc-700/90 focus:outline-none";
 
 const SELECTOR_ICON_CLASS =
   "w-6 h-6 rounded-md bg-white/[0.08] border border-white/[0.12] text-white/88 flex items-center justify-center shrink-0";
+
+function defaultSelectorFocusKey() {
+  const first = MODES.findIndex((m) => !m.disabled);
+  return first === -1 ? "gallery" : `mode-${first + 1}`;
+}
 
 function SettingsPanel({
   previewLoading,
@@ -1641,10 +1684,8 @@ function ModeSelector({
   // Arrow-key focus tracking for the main menu. Covers all 5 actionable
   // tiles: 3 mode buttons (Area/Fullscreen/Scroll) + Gallery + Settings.
   // Default focus is the first non-disabled mode.
-  const [focusedKey, setFocusedKey] = useState<string>(() => {
-    const first = MODES.findIndex((m) => !m.disabled);
-    return first === -1 ? "gallery" : `mode-${first + 1}`;
-  });
+  const [focusedKey, setFocusedKey] = useState<string>(() => defaultSelectorFocusKey());
+  const [showKeyboardFocus, setShowKeyboardFocus] = useState(false);
   const [previewLoading, setPreviewLoading] = useState<GalleryPreviewLoading>(() => {
     return window.localStorage.getItem(GALLERY_PREVIEW_LOADING_KEY) === "auto" ? "auto" : "on-demand";
   });
@@ -1656,8 +1697,23 @@ function ModeSelector({
     if (isClosing) {
       setViewingItem(null);
       setSelectorView("menu");
+      setFocusedKey(defaultSelectorFocusKey());
+      setShowKeyboardFocus(false);
+      if (document.activeElement instanceof HTMLElement) {
+        document.activeElement.blur();
+      }
     }
   }, [isClosing]);
+
+  useEffect(() => {
+    if (selectorView === "menu") {
+      setFocusedKey(defaultSelectorFocusKey());
+      setShowKeyboardFocus(false);
+      if (document.activeElement instanceof HTMLElement) {
+        document.activeElement.blur();
+      }
+    }
+  }, [selectorView]);
 
   useEffect(() => {
     invoke<string>("get_capture_hotkey")
@@ -1721,6 +1777,12 @@ function ModeSelector({
       if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
         e.preventDefault();
         e.stopPropagation();
+        if (!showKeyboardFocus) {
+          setShowKeyboardFocus(true);
+          setFocusedKey(defaultSelectorFocusKey());
+          return;
+        }
+        setShowKeyboardFocus(true);
         const delta = e.key === "ArrowLeft" ? -1 : 1;
         const sameRow = items.filter((it) => it.row === current.row && !it.disabled);
         if (sameRow.length === 0) return;
@@ -1730,12 +1792,24 @@ function ModeSelector({
       } else if (e.key === "ArrowDown") {
         e.preventDefault();
         e.stopPropagation();
+        if (!showKeyboardFocus) {
+          setShowKeyboardFocus(true);
+          setFocusedKey("gallery");
+          return;
+        }
+        setShowKeyboardFocus(true);
         if (current.row === 1) return;
         // Top → bottom: cols 0/1 land on Gallery, col 2 lands on Settings.
         setFocusedKey(current.col === 2 ? "settings" : "gallery");
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
         e.stopPropagation();
+        if (!showKeyboardFocus) {
+          setShowKeyboardFocus(true);
+          setFocusedKey(defaultSelectorFocusKey());
+          return;
+        }
+        setShowKeyboardFocus(true);
         if (current.row === 0) return;
         // Bottom → top: Gallery → first enabled mode, Settings → 2nd
         // enabled mode (or first if 2nd is disabled).
@@ -1754,7 +1828,7 @@ function ModeSelector({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [focusedKey, onSelect, selectorView, viewingItem]);
+  }, [focusedKey, onSelect, selectorView, showKeyboardFocus, viewingItem]);
 
   return (
     <motion.div
@@ -1793,12 +1867,15 @@ function ModeSelector({
 
               <div className="px-3 pb-3 grid grid-cols-3 gap-2">
                 {MODES.map((m, i) => {
-                  const focused = focusedKey === `mode-${i + 1}`;
+                  const focused = showKeyboardFocus && focusedKey === `mode-${i + 1}`;
                   return (
                   <button
                     key={m.key}
                     disabled={m.disabled}
-                    onClick={() => !m.disabled && onSelect(m.key)}
+                    onClick={(event) => {
+                      event.currentTarget.blur();
+                      if (!m.disabled) onSelect(m.key);
+                    }}
                     onMouseEnter={() => !m.disabled && setFocusedKey(`mode-${i + 1}`)}
                     className={[
                       SELECTOR_BUTTON_CLASS,
@@ -1823,7 +1900,7 @@ function ModeSelector({
                   onMouseEnter={() => setFocusedKey("gallery")}
                   className={[
                     SELECTOR_ACTION_CLASS,
-                    focusedKey === "gallery" ? "ring-2 ring-white/55 border-white/30 bg-zinc-800/95" : "",
+                    showKeyboardFocus && focusedKey === "gallery" ? "ring-2 ring-white/55 border-white/30 bg-zinc-800/95" : "",
                   ].join(" ")}
                 >
                   <span className="w-16 h-16 rounded-2xl bg-white/[0.08] border border-white/[0.12] text-white/88 flex items-center justify-center">
@@ -1839,7 +1916,7 @@ function ModeSelector({
                   onMouseEnter={() => setFocusedKey("settings")}
                   className={[
                     SELECTOR_ACTION_CLASS,
-                    focusedKey === "settings" ? "ring-2 ring-white/55 border-white/30 bg-zinc-800/95" : "",
+                    showKeyboardFocus && focusedKey === "settings" ? "ring-2 ring-white/55 border-white/30 bg-zinc-800/95" : "",
                   ].join(" ")}
                 >
                   <span className="w-16 h-16 rounded-2xl bg-white/[0.08] border border-white/[0.12] text-white/88 flex items-center justify-center">

@@ -1,8 +1,8 @@
-# Liem Shot — Product Requirements Document (PRD)
+# Liem Capture — Product Requirements Document (PRD)
 
 ## Product Name
 
-Liem Shot
+Liem Capture
 
 ## Tagline
 
@@ -18,11 +18,11 @@ Alternative Taglines:
 
 # 1. Product Vision
 
-Liem Shot is an ultra-lightweight screenshot utility focused on one primary workflow:
+Liem Capture is an ultra-lightweight screenshot utility focused on one primary workflow:
 
 > Take screenshot → instantly drag anywhere.
 
-Unlike traditional screenshot tools that rely on clipboard workflows or save dialogs, Liem Shot treats screenshots as temporary draggable visual assets.
+Unlike traditional screenshot tools that rely on clipboard workflows or save dialogs, Liem Capture treats screenshots as temporary draggable visual assets.
 
 The application prioritizes:
 
@@ -649,7 +649,7 @@ Mac-only.
 
 ---
 
-# Liem Shot Positioning
+# Liem Capture Positioning
 
 Windows-first ultra-lightweight drag-first screenshot workflow.
 
@@ -755,7 +755,7 @@ Avoid web-based hacks.
 
 # FINAL PRODUCT GOAL
 
-Liem Shot should feel like:
+Liem Capture should feel like:
 
 - a native Windows utility
 - extremely fast

@@ -5,7 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 const DISMISS_MS = 8000;
 const UNPIN_DISMISS_MS = 3000;
 const PREVIEW_TOOLS_DELAY_MS = 70;
-const COLOR_PREFS_KEY = "liem-shot-thumbnail-colors";
+const COLOR_PREFS_KEY = "liem-capture-thumbnail-colors";
 const DEFAULT_COLORS = ["#ff3b5f", "#ffffff", "#ffd84d", "#39d98a", "#4da3ff"];
 const CROP_MIN_CANVAS_SIZE = 12;
 const CROP_MIN_VISUAL_SIZE = 96;
@@ -46,6 +46,23 @@ type Point = { x: number; y: number };
 type CropHandle = "move" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w" | "nw";
 type CropRatioKey = "custom" | "1:1" | "4:3" | "16:9" | "3:4" | "9:16";
 type TransformAction = "rotate-right" | "rotate-left" | "flip-x" | "flip-y";
+type AiAction = "upscale" | "remove-bg" | "ocr";
+type OcrWord = {
+  text: string;
+  line_index: number;
+  word_index: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+type OcrBox = OcrWord & {
+  id: string;
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+};
 type CropRect = { x: number; y: number; w: number; h: number };
 type ShapeObject = {
   kind: ShapeTool;
@@ -65,6 +82,8 @@ const preview = document.querySelector<HTMLDivElement>("#preview")!;
 const shell = document.querySelector<HTMLElement>("#shell")!;
 const image = document.querySelector<HTMLImageElement>("#image")!;
 const editCanvas = document.querySelector<HTMLCanvasElement>("#edit-canvas")!;
+const ocrLayer = document.querySelector<HTMLDivElement>("#ocr-layer")!;
+const ocrSelection = document.querySelector<HTMLDivElement>("#ocr-selection")!;
 const previewDragBar = document.querySelector<HTMLDivElement>("#preview-drag-bar")!;
 const cropBox = document.querySelector<HTMLDivElement>("#crop-box")!;
 const cropConfirmButton = document.querySelector<HTMLButtonElement>("#crop-confirm")!;
@@ -79,10 +98,12 @@ const drawGroup = document.querySelector<HTMLDivElement>("#draw-group")!;
 const shapeGroup = document.querySelector<HTMLDivElement>("#shape-group")!;
 const cropGroup = document.querySelector<HTMLDivElement>("#crop-group")!;
 const transformGroup = document.querySelector<HTMLDivElement>("#transform-group")!;
+const aiGroup = document.querySelector<HTMLDivElement>("#ai-group")!;
 const drawButton = document.querySelector<HTMLButtonElement>("#tool-draw")!;
 const cropButton = document.querySelector<HTMLButtonElement>("#tool-crop")!;
 const shapeButton = document.querySelector<HTMLButtonElement>("#tool-shape")!;
 const transformButton = document.querySelector<HTMLButtonElement>("#tool-transform")!;
+const aiButton = document.querySelector<HTMLButtonElement>("#tool-ai")!;
 const sizeInput = document.querySelector<HTMLInputElement>("#tool-size")!;
 const colorInput = document.querySelector<HTMLInputElement>("#tool-color")!;
 const palette = document.querySelector<HTMLDivElement>("#palette")!;
@@ -164,6 +185,18 @@ let cameraPanState: {
   y: number;
   panX: number;
   panY: number;
+} | null = null;
+let aiBusy = false;
+let isOcrMode = false;
+let ocrWords: OcrWord[] = [];
+let ocrBoxes: OcrBox[] = [];
+let selectedOcrIds = new Set<string>();
+let ocrDragState: {
+  id: number;
+  startX: number;
+  startY: number;
+  x: number;
+  y: number;
 } | null = null;
 
 interface PointerState {
@@ -574,6 +607,172 @@ function drawSnapshot(dataUrl: string) {
   img.src = dataUrl;
 }
 
+function canvasFromDataUrl(dataUrl: string) {
+  return new Promise<HTMLCanvasElement>((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const next = document.createElement("canvas");
+      next.width = img.naturalWidth || img.width;
+      next.height = img.naturalHeight || img.height;
+      next.getContext("2d")?.drawImage(img, 0, 0);
+      resolve(next);
+    };
+    img.onerror = () => reject(new Error("AI result image could not be loaded"));
+    img.src = dataUrl;
+  });
+}
+
+function localPointInOcrLayer(event: { clientX: number; clientY: number }) {
+  const rect = ocrLayer.getBoundingClientRect();
+  return {
+    x: event.clientX - rect.left,
+    y: event.clientY - rect.top,
+  };
+}
+
+function orderedOcrSelection() {
+  return ocrBoxes
+    .filter((box) => selectedOcrIds.has(box.id))
+    .sort((a, b) => a.line_index - b.line_index || a.word_index - b.word_index);
+}
+
+function textFromOcrBoxes(boxes: OcrBox[]) {
+  const lines: string[] = [];
+  let currentLine = -1;
+  let lineWords: string[] = [];
+
+  for (const box of boxes) {
+    if (box.line_index !== currentLine) {
+      if (lineWords.length) lines.push(lineWords.join(" "));
+      currentLine = box.line_index;
+      lineWords = [];
+    }
+    lineWords.push(box.text);
+  }
+  if (lineWords.length) lines.push(lineWords.join(" "));
+  return lines.join("\n");
+}
+
+function updateOcrSelectionClasses() {
+  ocrLayer.querySelectorAll<HTMLElement>(".ocr-word").forEach((el) => {
+    el.classList.toggle("selected", selectedOcrIds.has(el.dataset.ocrId ?? ""));
+  });
+}
+
+function selectAllOcrText() {
+  selectedOcrIds = new Set(ocrBoxes.map((box) => box.id));
+  updateOcrSelectionClasses();
+  if (selectedOcrIds.size) {
+    flashStatus("All text selected");
+  } else {
+    flashStatus("No text found");
+  }
+}
+
+function renderOcrLayer(words: OcrWord[]) {
+  const content = canvasContentRect();
+  const layerRect = ocrLayer.getBoundingClientRect();
+  const offsetX = content.left - layerRect.left;
+  const offsetY = content.top - layerRect.top;
+
+  ocrBoxes = words.map((word) => {
+    const left = offsetX + word.x * content.scale;
+    const top = offsetY + word.y * content.scale;
+    const width = word.width * content.scale;
+    const height = word.height * content.scale;
+    return {
+      ...word,
+      id: `${word.line_index}:${word.word_index}`,
+      left,
+      top,
+      right: left + width,
+      bottom: top + height,
+    };
+  });
+
+  ocrLayer.querySelectorAll(".ocr-word").forEach((el) => el.remove());
+  for (const box of ocrBoxes) {
+    const el = document.createElement("div");
+    el.className = "ocr-word";
+    el.dataset.ocrId = box.id;
+    el.style.left = `${box.left}px`;
+    el.style.top = `${box.top}px`;
+    el.style.width = `${Math.max(4, box.right - box.left)}px`;
+    el.style.height = `${Math.max(4, box.bottom - box.top)}px`;
+    ocrLayer.appendChild(el);
+  }
+  updateOcrSelectionClasses();
+}
+
+function setOcrSelectionRect(startX: number, startY: number, x: number, y: number) {
+  const left = Math.min(startX, x);
+  const top = Math.min(startY, y);
+  const width = Math.abs(x - startX);
+  const height = Math.abs(y - startY);
+  ocrSelection.style.display = "block";
+  ocrSelection.style.left = `${left}px`;
+  ocrSelection.style.top = `${top}px`;
+  ocrSelection.style.width = `${width}px`;
+  ocrSelection.style.height = `${height}px`;
+}
+
+function selectOcrBoxesInRect(startX: number, startY: number, x: number, y: number) {
+  const left = Math.min(startX, x);
+  const top = Math.min(startY, y);
+  const right = Math.max(startX, x);
+  const bottom = Math.max(startY, y);
+  selectedOcrIds = new Set(
+    ocrBoxes
+      .filter((box) => box.right >= left && box.left <= right && box.bottom >= top && box.top <= bottom)
+      .map((box) => box.id),
+  );
+  updateOcrSelectionClasses();
+}
+
+async function copySelectedOcrText() {
+  const selected = orderedOcrSelection();
+  if (!selected.length) {
+    flashStatus("No text selected");
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(textFromOcrBoxes(selected));
+    flashStatus("Text copied");
+  } catch (error) {
+    flashStatus(`Copy failed: ${String(error)}`);
+  }
+}
+
+async function copySelectedOcrTextIfAny() {
+  if (!isOcrMode || selectedOcrIds.size === 0) return false;
+  await copySelectedOcrText();
+  return true;
+}
+
+function enterOcrMode(words: OcrWord[]) {
+  isOcrMode = true;
+  drawing = false;
+  setMode("draw");
+  setCropRect(null);
+  ocrWords = words;
+  selectedOcrIds = new Set();
+  shell.classList.add("ocr-mode");
+  renderOcrLayer(ocrWords);
+  flashStatus(words.length ? "Drag over text to copy" : "No text found");
+}
+
+function exitOcrMode() {
+  if (!isOcrMode) return;
+  isOcrMode = false;
+  ocrDragState = null;
+  ocrWords = [];
+  ocrBoxes = [];
+  selectedOcrIds = new Set();
+  ocrSelection.style.display = "none";
+  ocrLayer.querySelectorAll(".ocr-word").forEach((el) => el.remove());
+  shell.classList.remove("ocr-mode");
+}
+
 function layerContext() {
   const ctx = editLayer.getContext("2d", { willReadFrequently: true });
   if (!ctx) throw new Error("Edit layer unavailable");
@@ -743,6 +942,7 @@ function setDrawTool(tool: DrawTool) {
   drawGroup.classList.remove("open");
   cropGroup.classList.remove("open");
   transformGroup.classList.remove("open");
+  aiGroup.classList.remove("open");
 }
 
 function setShapeTool(tool: ShapeTool) {
@@ -755,6 +955,7 @@ function setShapeTool(tool: ShapeTool) {
   shapeGroup.classList.remove("open");
   cropGroup.classList.remove("open");
   transformGroup.classList.remove("open");
+  aiGroup.classList.remove("open");
 }
 
 function updateCropRatioMenu() {
@@ -965,6 +1166,7 @@ function resetAndPauseTimer(durationMs = DISMISS_MS) {
 async function hideThumbnail() {
   if (isDismissing) return;
 
+  const shouldDiscardUnsaved = !!filePath && !hasUserSaved;
   setNativePreviewMode(false);
   isDismissing = true;
   clearHideTimeout();
@@ -972,6 +1174,9 @@ async function hideThumbnail() {
   await new Promise((resolve) => window.setTimeout(resolve, 360));
 
   try {
+    if (shouldDiscardUnsaved) {
+      await invoke("discard_unsaved_capture", { path: filePath }).catch(console.error);
+    }
     await invoke("hide_thumbnail", { label: currentWindow.label });
   } catch (error) {
     console.error(error);
@@ -1028,6 +1233,7 @@ function requestThumbnailReveal() {
 }
 
 function prepareThumbnailForUpdate() {
+  exitOcrMode();
   setNativePreviewMode(false);
   isDismissing = false;
   isPreviewMode = false;
@@ -1062,6 +1268,7 @@ function prepareThumbnailForUpdate() {
 }
 
 function forceThumbnailMode() {
+  exitOcrMode();
   isPreviewMode = false;
   isEditorReady = false;
   drawing = false;
@@ -1164,6 +1371,7 @@ async function enterPreviewMode(viewOnly = false) {
 
 function exitPreviewMode() {
   if (!isPreviewMode) return;
+  exitOcrMode();
 
   // Mirror the current edits onto the floating thumbnail tile so the
   // user can see what they did at a glance after minimizing. The actual
@@ -1377,6 +1585,50 @@ function applyTransform(action: TransformAction) {
   replaceCanvasWith(next, before, mode === "crop");
 }
 
+function setAiBusy(next: boolean) {
+  aiBusy = next;
+  aiButton.disabled = next;
+  document.querySelectorAll<HTMLButtonElement>("[data-ai-action]").forEach((button) => {
+    button.disabled = next;
+  });
+}
+
+async function runAiAction(action: AiAction, scale = 2) {
+  if (!isPreviewMode || !isEditorReady) return;
+  if (aiBusy) return;
+
+  const label =
+    action === "upscale"
+      ? `Upscale ${scale}x`
+      : action === "remove-bg"
+        ? "Remove background"
+        : "OCR copy text";
+
+  setAiBusy(true);
+  setStatus(`${label}...`);
+
+  try {
+    const before = captureSnapshot();
+
+    if (action === "ocr") {
+      const words = await invoke<OcrWord[]>("ai_ocr_layout", { dataUrl: before });
+      enterOcrMode(words);
+      return;
+    }
+
+    const dataUrl = action === "upscale"
+      ? await invoke<string>("ai_upscale_image", { dataUrl: before, scale })
+      : await invoke<string>("ai_remove_background", { dataUrl: before });
+    const next = await canvasFromDataUrl(dataUrl);
+    replaceCanvasWith(next, before, mode === "crop");
+    flashStatus(action === "upscale" ? `Upscaled ${scale}x` : "Background removed");
+  } catch (error) {
+    flashStatus(String(error));
+  } finally {
+    setAiBusy(false);
+  }
+}
+
 preview.addEventListener("pointerdown", (event) => {
   if (event.button !== 0 || !filePath || isPreviewMode) return;
 
@@ -1563,6 +1815,20 @@ editCanvas.addEventListener(
   { passive: false },
 );
 
+ocrLayer.addEventListener(
+  "wheel",
+  (event) => {
+    if (!isOcrMode || !isPreviewMode || !isEditorReady || !event.ctrlKey) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    const zoomFactor = Math.exp(-event.deltaY * 0.0016);
+    setCameraView(cameraZoom * zoomFactor);
+    renderOcrLayer(ocrWords);
+  },
+  { passive: false },
+);
+
 editCanvas.addEventListener("auxclick", (event) => {
   if (event.button === 1) {
     event.preventDefault();
@@ -1571,6 +1837,7 @@ editCanvas.addEventListener("auxclick", (event) => {
 
 editCanvas.addEventListener("pointerdown", (event) => {
   if (!isPreviewMode || !isEditorReady) return;
+  if (isOcrMode) return;
 
   if (event.button === 1) {
     event.preventDefault();
@@ -1609,6 +1876,60 @@ editCanvas.addEventListener("pointerdown", (event) => {
   }
   layerBeforeAction = captureLayer();
   editCanvas.setPointerCapture(event.pointerId);
+});
+
+ocrLayer.addEventListener("pointerdown", (event) => {
+  if (!isOcrMode || event.button !== 0) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  const point = localPointInOcrLayer(event);
+  ocrDragState = {
+    id: event.pointerId,
+    startX: point.x,
+    startY: point.y,
+    x: point.x,
+    y: point.y,
+  };
+  selectedOcrIds = new Set();
+  updateOcrSelectionClasses();
+  setOcrSelectionRect(point.x, point.y, point.x, point.y);
+  ocrLayer.setPointerCapture(event.pointerId);
+});
+
+ocrLayer.addEventListener("pointermove", (event) => {
+  if (!isOcrMode || !ocrDragState || event.pointerId !== ocrDragState.id) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  const point = localPointInOcrLayer(event);
+  ocrDragState.x = point.x;
+  ocrDragState.y = point.y;
+  setOcrSelectionRect(ocrDragState.startX, ocrDragState.startY, point.x, point.y);
+  selectOcrBoxesInRect(ocrDragState.startX, ocrDragState.startY, point.x, point.y);
+});
+
+ocrLayer.addEventListener("pointerup", (event) => {
+  if (!isOcrMode || !ocrDragState || event.pointerId !== ocrDragState.id) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  const state = ocrDragState;
+  ocrDragState = null;
+  if (ocrLayer.hasPointerCapture(event.pointerId)) {
+    ocrLayer.releasePointerCapture(event.pointerId);
+  }
+  selectOcrBoxesInRect(state.startX, state.startY, state.x, state.y);
+  ocrSelection.style.display = "none";
+  if (selectedOcrIds.size) {
+    flashStatus("Text selected");
+  }
+});
+
+ocrLayer.addEventListener("pointercancel", (event) => {
+  if (!ocrDragState || event.pointerId !== ocrDragState.id) return;
+  ocrDragState = null;
+  ocrSelection.style.display = "none";
 });
 
 editCanvas.addEventListener("pointerenter", (event) => {
@@ -1760,7 +2081,7 @@ closeButton.addEventListener("click", () => {
 });
 
 minimizeButton.addEventListener("click", () => {
-  if (!isPreviewMode) return;
+  if (!isPreviewMode || isPinned) return;
 
   exitPreviewMode();
 });
@@ -1797,6 +2118,7 @@ drawButton.addEventListener("click", () => {
   shapeGroup.classList.remove("open");
   cropGroup.classList.remove("open");
   transformGroup.classList.remove("open");
+  aiGroup.classList.remove("open");
   setMode("draw");
 });
 
@@ -1805,6 +2127,7 @@ drawButton.addEventListener("dblclick", () => {
   shapeGroup.classList.remove("open");
   cropGroup.classList.remove("open");
   transformGroup.classList.remove("open");
+  aiGroup.classList.remove("open");
   setMode("draw");
 });
 
@@ -1813,6 +2136,7 @@ shapeButton.addEventListener("click", () => {
   drawGroup.classList.remove("open");
   cropGroup.classList.remove("open");
   transformGroup.classList.remove("open");
+  aiGroup.classList.remove("open");
   setMode("shape");
 });
 
@@ -1821,6 +2145,7 @@ shapeButton.addEventListener("dblclick", () => {
   drawGroup.classList.remove("open");
   cropGroup.classList.remove("open");
   transformGroup.classList.remove("open");
+  aiGroup.classList.remove("open");
   setMode("shape");
 });
 
@@ -1829,6 +2154,7 @@ cropButton.addEventListener("click", () => {
   shapeGroup.classList.remove("open");
   cropGroup.classList.remove("open");
   transformGroup.classList.remove("open");
+  aiGroup.classList.remove("open");
   setMode("crop");
 });
 
@@ -1836,6 +2162,7 @@ cropButton.addEventListener("dblclick", () => {
   drawGroup.classList.remove("open");
   shapeGroup.classList.remove("open");
   transformGroup.classList.remove("open");
+  aiGroup.classList.remove("open");
   cropGroup.classList.add("open");
   setMode("crop");
 });
@@ -1844,7 +2171,16 @@ transformButton.addEventListener("click", () => {
   drawGroup.classList.remove("open");
   shapeGroup.classList.remove("open");
   cropGroup.classList.remove("open");
+  aiGroup.classList.remove("open");
   transformGroup.classList.toggle("open");
+});
+
+aiButton.addEventListener("click", () => {
+  drawGroup.classList.remove("open");
+  shapeGroup.classList.remove("open");
+  cropGroup.classList.remove("open");
+  transformGroup.classList.remove("open");
+  aiGroup.classList.toggle("open");
 });
 
 document.querySelectorAll<HTMLButtonElement>("[data-crop-ratio]").forEach((button) => {
@@ -1861,6 +2197,17 @@ document.querySelectorAll<HTMLButtonElement>("[data-transform-action]").forEach(
 
     transformGroup.classList.remove("open");
     applyTransform(action);
+  });
+});
+
+document.querySelectorAll<HTMLButtonElement>("[data-ai-action]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const action = button.dataset.aiAction as AiAction | undefined;
+    if (!action) return;
+    const scale = Number(button.dataset.aiScale ?? "2") || 2;
+
+    aiGroup.classList.remove("open");
+    void runAiAction(action, scale);
   });
 });
 
@@ -1922,9 +2269,9 @@ clearButton.addEventListener("click", () => {
 // Persistent preferences across edit sessions — both keys live in
 // localStorage so the next time the user pops open the save menu their
 // most recent destination is the default.
-const LAST_GALLERY_FOLDER_KEY = "liem-shot:last-gallery-folder";
-const LAST_SAVE_AS_DIR_KEY = "liem-shot:last-save-as-dir";
-const GALLERY_PREVIEW_LOADING_KEY = "liem-shot:gallery-preview-loading";
+const LAST_GALLERY_FOLDER_KEY = "liem-capture:last-gallery-folder";
+const LAST_SAVE_AS_DIR_KEY = "liem-capture:last-save-as-dir";
+const GALLERY_PREVIEW_LOADING_KEY = "liem-capture:gallery-preview-loading";
 const saveMenu = document.querySelector<HTMLDivElement>("#save-menu")!;
 
 interface SaveFolderNode {
@@ -1992,6 +2339,7 @@ let pickerTree: SaveFolderNode | null = null;
 let pickerSelectedPath: string = ""; // "" = gallery root
 let pickerExpandedFolders: Set<string> = new Set();
 let pickerSelectedItem: string | null = null;
+let pickerKeyboardArea: "tree" | "grid" = "tree";
 let pickerFilesVisiblePath: string | null = null;
 let pickerVisibleItemCount = 0;
 let pickerPromptRequestId = 0;
@@ -2151,7 +2499,7 @@ function renderPickerTree() {
       </div>`;
 
     items.push(
-      `<div class="picker-tree-row${active ? " active" : ""}" data-folder-path="${escapeHtml(path)}" data-tree-action="select" style="padding-left: ${4 + depth * 12}px;">
+      `<div class="picker-tree-row${active ? " active" : ""}" data-folder-path="${escapeHtml(path)}" data-tree-action="select" data-tree-depth="${depth}" data-tree-has-children="${hasChildren ? "true" : "false"}" data-tree-expanded="${expanded ? "true" : "false"}" style="padding-left: ${4 + depth * 12}px;">
         ${chevron}
         ${FOLDER_ICON}
         <span class="picker-tree-label">${escapeHtml(node.name)}</span>
@@ -2181,7 +2529,7 @@ async function refreshPickerTree() {
 // ─── Folder operations (create / rename / delete) ───────────────────────
 async function handleTreeCreate(parentPath: string) {
   const folder = findPickerFolder(pickerTree, parentPath);
-  const parentName = folder?.name ?? "Liem Shot";
+  const parentName = folder?.name ?? "Liem Capture";
   const name = await pickerDialog({
     title: "New folder",
     message: `Inside "${parentName}"`,
@@ -2295,10 +2643,68 @@ function refreshPickerGridView() {
   else void renderPickerBrowsePrompt();
 }
 
+function selectPickerFolder(path: string) {
+  pickerSelectedPath = path;
+  pickerSelectedItem = null;
+  pickerFilesVisiblePath = shouldAutoLoadPickerFiles() ? pickerSelectedPath : null;
+  pickerVisibleItemCount = PICKER_ITEM_CHUNK_SIZE;
+  renderPickerTree();
+  renderPickerInfo();
+  updatePickerCurrentLabel();
+  refreshPickerGridView();
+  pickerTreeEl
+    .querySelector<HTMLElement>(`[data-tree-action="select"][data-folder-path="${CSS.escape(path)}"]`)
+    ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+}
+
+function visiblePickerRows() {
+  return Array.from(pickerTreeEl.querySelectorAll<HTMLElement>(".picker-tree-row[data-folder-path]"));
+}
+
+function visiblePickerTiles() {
+  return Array.from(pickerGridEl.querySelectorAll<HTMLElement>("[data-preview-path]"));
+}
+
+function selectPickerTile(path: string | null) {
+  pickerSelectedItem = path;
+  pickerGridEl.querySelectorAll<HTMLElement>(".picker-tile.selected").forEach((el) => {
+    el.classList.remove("selected");
+  });
+  if (pickerSelectedItem) {
+    const tile = pickerGridEl.querySelector<HTMLElement>(
+      `[data-preview-path="${CSS.escape(pickerSelectedItem)}"]`,
+    );
+    tile?.classList.add("selected");
+    tile?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+  renderPickerInfo();
+}
+
+function movePickerTreeSelection(delta: number) {
+  const rows = visiblePickerRows();
+  if (!rows.length) return;
+  const currentIndex = rows.findIndex((row) => (row.dataset.folderPath ?? "") === pickerSelectedPath);
+  const baseIndex = currentIndex === -1 ? 0 : currentIndex;
+  const nextIndex = Math.max(0, Math.min(rows.length - 1, baseIndex + delta));
+  selectPickerFolder(rows[nextIndex].dataset.folderPath ?? "");
+}
+
+function movePickerGridSelection(delta: number) {
+  const tiles = visiblePickerTiles();
+  if (!tiles.length) return;
+  const currentIndex = pickerSelectedItem
+    ? tiles.findIndex((tile) => tile.dataset.previewPath === pickerSelectedItem)
+    : -1;
+  const baseIndex = currentIndex === -1 ? 0 : currentIndex;
+  const nextIndex = Math.max(0, Math.min(tiles.length - 1, baseIndex + delta));
+  selectPickerTile(tiles[nextIndex].dataset.previewPath ?? null);
+}
+
 // Single delegated handler covers every tree-row interaction. The
 // `data-tree-action` attribute on the inner button (or the row itself
 // for plain selection) decides which path to take.
 pickerTreeEl.addEventListener("click", (event) => {
+  pickerKeyboardArea = "tree";
   const actionEl = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-tree-action]");
   if (!actionEl) return;
   const action = actionEl.dataset.treeAction;
@@ -2315,14 +2721,7 @@ pickerTreeEl.addEventListener("click", (event) => {
 
   // Default = row click = select folder.
   if (path !== pickerSelectedPath) {
-    pickerSelectedPath = path;
-    pickerSelectedItem = null;
-    pickerFilesVisiblePath = shouldAutoLoadPickerFiles() ? pickerSelectedPath : null;
-    pickerVisibleItemCount = PICKER_ITEM_CHUNK_SIZE;
-    renderPickerTree();
-    renderPickerInfo();
-    updatePickerCurrentLabel();
-    refreshPickerGridView();
+    selectPickerFolder(path);
   }
 });
 
@@ -2529,6 +2928,7 @@ async function deletePickerItem(path: string) {
 
 // Click on a tile in the grid → select for info viewing.
 pickerGridEl.addEventListener("click", (event) => {
+  pickerKeyboardArea = "grid";
   const action = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-picker-grid-action]");
   if (action?.dataset.pickerGridAction === "show-files") {
     pickerFilesVisiblePath = pickerSelectedPath;
@@ -2545,17 +2945,7 @@ pickerGridEl.addEventListener("click", (event) => {
   const tile = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-preview-path]");
   if (!tile) return;
   const path = tile.dataset.previewPath ?? "";
-  pickerSelectedItem = pickerSelectedItem === path ? null : path;
-  // Update selected class without full re-render (cheaper).
-  pickerGridEl.querySelectorAll<HTMLElement>(".picker-tile.selected").forEach((el) => {
-    el.classList.remove("selected");
-  });
-  if (pickerSelectedItem) {
-    pickerGridEl
-      .querySelector<HTMLElement>(`[data-preview-path="${CSS.escape(pickerSelectedItem)}"]`)
-      ?.classList.add("selected");
-  }
-  renderPickerInfo();
+  selectPickerTile(pickerSelectedItem === path ? null : path);
 });
 
 // Info panel action delegation (close / rename / delete).
@@ -2584,6 +2974,65 @@ window.addEventListener("keydown", (event) => {
   // Don't fire while a dialog is open (its own listeners handle keys).
   if (!pickerDialogEl.hidden) return;
 
+  const isArrow = event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "ArrowUp" || event.key === "ArrowDown";
+  if (isArrow) {
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (pickerKeyboardArea === "grid" && pickerFilesVisiblePath === pickerSelectedPath && visiblePickerTiles().length > 0) {
+      const delta =
+        event.key === "ArrowLeft" ? -1 :
+        event.key === "ArrowRight" ? 1 :
+        event.key === "ArrowUp" ? -3 :
+        3;
+      movePickerGridSelection(delta);
+      return;
+    }
+
+    pickerKeyboardArea = "tree";
+    if (event.key === "ArrowDown") {
+      movePickerTreeSelection(1);
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      movePickerTreeSelection(-1);
+      return;
+    }
+
+    const currentRow = visiblePickerRows().find((row) => (row.dataset.folderPath ?? "") === pickerSelectedPath);
+    if (!currentRow) return;
+    const hasChildren = currentRow.dataset.treeHasChildren === "true";
+    const expanded = currentRow.dataset.treeExpanded === "true";
+    if (event.key === "ArrowRight" && hasChildren && !expanded) {
+      togglePickerExpand(pickerSelectedPath === "" ? "__root__" : pickerSelectedPath);
+      return;
+    }
+    if (event.key === "ArrowLeft") {
+      if (hasChildren && expanded) {
+        togglePickerExpand(pickerSelectedPath === "" ? "__root__" : pickerSelectedPath);
+        return;
+      }
+      const currentDepth = Number(currentRow.dataset.treeDepth ?? "0");
+      if (currentDepth <= 0) return;
+      const rows = visiblePickerRows();
+      const currentIndex = rows.indexOf(currentRow);
+      for (let i = currentIndex - 1; i >= 0; i -= 1) {
+        if (Number(rows[i].dataset.treeDepth ?? "0") === currentDepth - 1) {
+          selectPickerFolder(rows[i].dataset.folderPath ?? "");
+          return;
+        }
+      }
+    }
+    return;
+  }
+
+  if (event.key === "Enter") {
+    event.preventDefault();
+    event.stopPropagation();
+    confirmSaveFromPicker();
+    return;
+  }
+
   if (event.key === "F2") {
     event.preventDefault();
     event.stopPropagation();
@@ -2606,7 +3055,7 @@ function updatePickerCurrentLabel() {
 
 function autoExpandAncestors(rootPath: string, targetPath: string) {
   if (!targetPath || targetPath === rootPath) return;
-  // The path "D:/Liem Shot/Foo/Bar" needs every ancestor segment
+  // The path "D:/Liem Capture/Foo/Bar" needs every ancestor segment
   // expanded so the selected node is actually visible. Walk parents
   // until we hit the gallery root (or filesystem root as a fallback).
   let current = targetPath;
@@ -2900,6 +3349,18 @@ shell.addEventListener("mouseleave", () => {
 });
 
 window.addEventListener("keydown", (event) => {
+  if (isOcrMode && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
+    event.preventDefault();
+    selectAllOcrText();
+    return;
+  }
+
+  if (isOcrMode && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
+    event.preventDefault();
+    void copySelectedOcrTextIfAny();
+    return;
+  }
+
   if (isPreviewMode && isEditorReady && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
     event.preventDefault();
     if (event.shiftKey) redoButton.click();
@@ -2916,6 +3377,11 @@ window.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
 
   event.preventDefault();
+  if (isOcrMode) {
+    exitOcrMode();
+    flashStatus("OCR canceled");
+    return;
+  }
   if (isPreviewMode && isEditorReady && drawing) {
     drawing = false;
     if (mode === "crop") {
@@ -2943,6 +3409,7 @@ document.addEventListener("pointerdown", (event) => {
   if (!shapeGroup.contains(target)) shapeGroup.classList.remove("open");
   if (!cropGroup.contains(target)) cropGroup.classList.remove("open");
   if (!transformGroup.contains(target)) transformGroup.classList.remove("open");
+  if (!aiGroup.contains(target)) aiGroup.classList.remove("open");
   if (!saveGroup.contains(target)) saveGroup.classList.remove("open");
 });
 

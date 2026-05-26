@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Liem Shot Thumbnail</title>
+    <title>Liem Capture Thumbnail</title>
     <style>
       * {
         box-sizing: border-box;
@@ -23,6 +23,39 @@
 
       body {
         padding: 0;
+      }
+
+      .liem-scrollbar {
+        scrollbar-width: thin;
+        scrollbar-color: rgba(255, 255, 255, 0.34) rgba(255, 255, 255, 0.045);
+      }
+
+      .liem-scrollbar::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+      }
+
+      .liem-scrollbar::-webkit-scrollbar-track {
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.018));
+        border-radius: 999px;
+        border: 3px solid transparent;
+        background-clip: padding-box;
+      }
+
+      .liem-scrollbar::-webkit-scrollbar-thumb {
+        min-height: 34px;
+        border-radius: 999px;
+        border: 3px solid transparent;
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0.3)) padding-box;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 0 12px rgba(255, 255, 255, 0.08);
+      }
+
+      .liem-scrollbar::-webkit-scrollbar-thumb:hover {
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(255, 255, 255, 0.46)) padding-box;
+      }
+
+      .liem-scrollbar::-webkit-scrollbar-corner {
+        background: transparent;
       }
 
       #shell {
@@ -126,6 +159,47 @@
         cursor: move;
         z-index: 2;
         touch-action: none;
+      }
+
+      #ocr-layer {
+        position: absolute;
+        inset: 66px 12px 12px;
+        z-index: 2;
+        display: none;
+        border-radius: 12px;
+        cursor: text;
+        touch-action: none;
+      }
+
+      #shell.ocr-mode #ocr-layer {
+        display: block;
+      }
+
+      #shell.ocr-mode #edit-canvas {
+        pointer-events: none;
+      }
+
+      .ocr-word {
+        position: absolute;
+        border-radius: 4px;
+        background: rgba(255, 214, 64, 0.24);
+        box-shadow: inset 0 0 0 1px rgba(255, 238, 150, 0.42);
+        pointer-events: none;
+      }
+
+      .ocr-word.selected {
+        background: rgba(92, 180, 255, 0.34);
+        box-shadow: inset 0 0 0 1px rgba(160, 218, 255, 0.74);
+      }
+
+      #ocr-selection {
+        position: absolute;
+        display: none;
+        border: 1px solid rgba(120, 205, 255, 0.96);
+        border-radius: 6px;
+        background: rgba(90, 180, 255, 0.16);
+        box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.25);
+        pointer-events: none;
       }
 
       #crop-box::before {
@@ -436,6 +510,12 @@
         right: 8px;
       }
 
+      #shell.pinned #minimize {
+        display: none;
+        opacity: 0;
+        pointer-events: none;
+      }
+
       #shell.preview-mode.tools-ready #pin,
       #shell.preview-mode #bar {
         opacity: 0;
@@ -459,6 +539,12 @@
         right: 38px;
       }
 
+      #shell.pinned.preview-mode.tools-ready #minimize {
+        display: none;
+        opacity: 0;
+        pointer-events: none;
+      }
+
       #toolbar {
         position: absolute;
         left: 0;
@@ -469,7 +555,7 @@
         margin: 0 auto;
         display: inline-flex;
         align-items: center;
-        gap: 6px;
+        gap: 8px;
         padding: 6px;
         border: 1px solid rgba(255, 255, 255, 0.16);
         border-radius: 999px;
@@ -511,6 +597,10 @@
 
       #transform-menu {
         min-width: 158px;
+      }
+
+      #ai-menu {
+        min-width: 176px;
       }
 
       .tool-group.open .tool-menu {
@@ -768,12 +858,14 @@
       .picker-main {
         flex: 1;
         min-width: 0;
-        padding: 12px 12px 14px;
+        padding: 12px 14px 14px 12px;
         overflow-y: auto;
       }
       .picker-grid {
         display: grid;
-        grid-template-columns: repeat(3, 1fr);
+        grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+        grid-auto-rows: auto;
+        align-items: start;
         gap: 8px;
       }
       .picker-grid.is-prompt {
@@ -784,6 +876,8 @@
       }
       .picker-tile {
         aspect-ratio: 3 / 2;
+        width: 100%;
+        min-width: 0;
         overflow: hidden;
         border-radius: 8px;
         border: 1px solid rgba(255, 255, 255, 0.15);
@@ -812,11 +906,14 @@
         width: 200px;
         flex-shrink: 0;
         border-left: 1px solid rgba(255, 255, 255, 0.12);
-        padding: 10px 12px;
+        padding: 10px 14px 10px 12px;
         overflow-y: auto;
         display: flex;
         flex-direction: column;
         gap: 10px;
+      }
+      .picker-info[hidden] {
+        display: none;
       }
       .picker-info-header {
         display: flex;
@@ -1110,9 +1207,9 @@
       .toolbar-divider {
         width: 1px;
         height: 22px;
-        margin: 0 4px;
+        margin: 0 7px;
         border-radius: 999px;
-        background: rgba(255, 255, 255, 0.34);
+        background: rgba(255, 255, 255, 0.24);
         box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.26);
       }
 
@@ -1161,6 +1258,9 @@
       <section id="preview" aria-label="Screenshot preview">
         <img id="image" alt="Screenshot" draggable="false" hidden />
         <canvas id="edit-canvas"></canvas>
+        <div id="ocr-layer" aria-label="OCR text selection layer">
+          <div id="ocr-selection"></div>
+        </div>
         <div id="crop-box">
           <button id="crop-cancel" class="crop-action" title="Cancel crop" aria-label="Cancel crop">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -1284,6 +1384,7 @@
         <div id="palette" aria-label="Color palette">
           <input id="tool-color" type="color" value="#ff3b5f" title="Color" aria-label="Color" />
         </div>
+        <span class="toolbar-divider" aria-hidden="true"></span>
         <div id="crop-group" class="tool-group">
           <button id="tool-crop" class="tool-button" title="Crop" aria-label="Crop">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -1341,6 +1442,54 @@
             </button>
           </div>
         </div>
+        <div id="ai-group" class="tool-group">
+          <button id="tool-ai" class="tool-button" title="AI tools" aria-label="AI tools">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" />
+              <path d="M18.5 14l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+              <path d="M5.5 14l.6 1.6 1.6.6-1.6.6-.6 1.6-.6-1.6-1.6-.6 1.6-.6.6-1.6z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+            </svg>
+          </button>
+          <div id="ai-menu" class="tool-menu">
+            <button class="menu-item" data-ai-action="upscale" data-ai-scale="2">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M7 17L17 7M11 7h6v6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" />
+                <path d="M5 5h5M5 5v5M19 19h-5M19 19v-5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+              </svg>
+              Upscale 2x
+            </button>
+            <button class="menu-item" data-ai-action="upscale" data-ai-scale="3">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M7 17L17 7M11 7h6v6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" />
+                <path d="M5 5h5M5 5v5M19 19h-5M19 19v-5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+              </svg>
+              Upscale 3x
+            </button>
+            <button class="menu-item" data-ai-action="upscale" data-ai-scale="4">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M7 17L17 7M11 7h6v6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" />
+                <path d="M5 5h5M5 5v5M19 19h-5M19 19v-5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+              </svg>
+              Upscale 4x
+            </button>
+            <button class="menu-item" data-ai-action="remove-bg">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M5 6h14v12H5V6z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" />
+                <path d="M8 9h2M14 9h2M8 15h2M14 15h2M11 12h2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+                <path d="M4 20L20 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+              </svg>
+              Remove background
+            </button>
+            <button class="menu-item" data-ai-action="ocr">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M6 4h9l3 3v13H6V4z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" />
+                <path d="M15 4v4h4" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" />
+                <path d="M8.5 11h7M8.5 14h7M8.5 17h4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+              </svg>
+              OCR / Copy text
+            </button>
+          </div>
+        </div>
         <span class="toolbar-divider" aria-hidden="true"></span>
         <button id="tool-undo" class="tool-button" title="Undo" aria-label="Undo" disabled>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -1368,7 +1517,7 @@
               <path d="M8 4v6h8V4M8 20v-6h8v6" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" />
             </svg>
           </button>
-          <div id="save-menu" class="tool-menu" style="left: auto; right: -6px; transform: none; min-width: 200px; max-height: 320px; overflow-y: auto;">
+          <div id="save-menu" class="tool-menu liem-scrollbar" style="left: auto; right: -6px; transform: none; min-width: 200px; max-height: 320px; overflow-y: auto;">
             <!-- Populated dynamically by thumbnail.ts whenever the save
                  button is clicked (so the folder list is always fresh). -->
           </div>
@@ -1388,11 +1537,11 @@
             </button>
           </header>
           <div class="picker-body">
-            <aside id="picker-tree" class="picker-tree"></aside>
-            <section class="picker-main">
+            <aside id="picker-tree" class="picker-tree liem-scrollbar"></aside>
+            <section class="picker-main liem-scrollbar">
               <div id="picker-grid" class="picker-grid"></div>
             </section>
-            <aside id="picker-info" class="picker-info" hidden>
+            <aside id="picker-info" class="picker-info liem-scrollbar" hidden>
               <!-- Populated by JS when a tile is selected. -->
             </aside>
           </div>

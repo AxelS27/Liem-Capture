@@ -70,9 +70,26 @@ fn gallery_dir(app: &AppHandle) -> PathBuf {
         .path()
         .document_dir()
         .unwrap_or_else(|_| std::env::temp_dir());
-    p.push("Liem Shot");
+    p.push("Liem Capture");
     std::fs::create_dir_all(&p).ok();
     p
+}
+
+fn temp_capture_dir(app: &AppHandle) -> PathBuf {
+    let mut p = app
+        .path()
+        .app_cache_dir()
+        .unwrap_or_else(|_| std::env::temp_dir().join("Liem Capture"));
+    p.push("unsaved-captures");
+    std::fs::create_dir_all(&p).ok();
+    p
+}
+
+fn is_temp_capture_path(app: &AppHandle, path: &Path) -> bool {
+    let root = temp_capture_dir(app);
+    let canonical_root = std::fs::canonicalize(&root).unwrap_or(root);
+    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical_path.starts_with(canonical_root)
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -95,7 +112,7 @@ pub struct FolderNode {
 /// Resolve a user-supplied path to one that we are willing to act on.
 /// All gallery operations are sandboxed under the gallery root — this guards
 /// against the frontend (or a hostile caller) handing us something outside
-/// Documents/Liem Shot like "C:\Windows\System32".
+/// Documents/Liem Capture like "C:\Windows\System32".
 fn resolve_gallery_path(app: &AppHandle, raw: Option<String>) -> Result<PathBuf, String> {
     let root = gallery_dir(app);
     let candidate = match raw {
@@ -135,7 +152,7 @@ fn build_folder_tree(path: &Path) -> FolderNode {
 }
 
 /// Returns the full folder tree under the gallery root. The root node's
-/// `name` is "Liem Shot" (or whatever the user's locale calls Documents),
+/// `name` is "Liem Capture" (or whatever the user's locale calls Documents),
 /// `path` is the canonical absolute path, and `children` is the recursive
 /// folder structure. Folders sorted alphabetically, case-insensitive.
 #[command]
@@ -143,7 +160,7 @@ pub fn list_gallery_tree(app: AppHandle) -> FolderNode {
     let root = gallery_dir(&app);
     let mut tree = build_folder_tree(&root);
     // Force the root display name so the frontend has a stable label.
-    tree.name = "Liem Shot".into();
+    tree.name = "Liem Capture".into();
     tree
 }
 
@@ -593,11 +610,17 @@ pub fn save_edited_thumbnail(
     //                                            foo_1.png). The edits make
     //                                            it a genuinely new artifact.
     // Resolve target folder: explicit dest_folder, else the file's
-    // current folder (so a rename-in-place via dest_name still works).
+    // current folder. Fresh captures live in the temp capture directory,
+    // so a named save with no explicit folder means "gallery root".
+    let named_gallery_save = dest_name
+        .as_ref()
+        .is_some_and(|name| !name.trim().is_empty());
     let target_folder: PathBuf = if let Some(folder) =
         dest_folder.filter(|f| !f.trim().is_empty())
     {
         resolve_gallery_path(&app, Some(folder))?
+    } else if named_gallery_save {
+        gallery_dir(&app)
     } else {
         src.parent()
             .map(|p| p.to_path_buf())
@@ -693,6 +716,15 @@ pub fn save_edited_thumbnail(
 }
 
 #[command]
+pub fn discard_unsaved_capture(app: AppHandle, path: String) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    if is_temp_capture_path(&app, &path) && path.exists() {
+        std::fs::remove_file(path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[command]
 pub fn take_screenshot(
     app: AppHandle,
     x: i32,
@@ -730,7 +762,7 @@ pub fn take_screenshot(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let path = gallery_dir(&app).join(format!("shot_{ts}.png"));
+    let path = temp_capture_dir(&app).join(format!("shot_{ts}.png"));
     let path_str = path.to_string_lossy().to_string();
     let idx = window::reserve_thumbnail_index();
     push_thumbnail(&app, path_str.clone(), &cropped, idx);
@@ -753,7 +785,7 @@ pub fn take_fullscreen(app: AppHandle) -> Result<String, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let path = gallery_dir(&app).join(format!("shot_{ts}.png"));
+    let path = temp_capture_dir(&app).join(format!("shot_{ts}.png"));
     let path_str = path.to_string_lossy().to_string();
     let idx = window::reserve_thumbnail_index();
     push_thumbnail(&app, path_str.clone(), &image, idx);

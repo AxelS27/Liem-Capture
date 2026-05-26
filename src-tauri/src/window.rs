@@ -542,7 +542,7 @@ pub fn create_overlay(app: &AppHandle) -> tauri::Result<()> {
     };
 
     let overlay = WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("/#/overlay".into()))
-        .title("Liem Shot Overlay")
+        .title("Liem Capture Overlay")
         .inner_size(w, h)
         .position(mx, my)
         .decorations(false)

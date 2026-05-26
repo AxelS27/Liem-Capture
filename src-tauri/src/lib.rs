@@ -4,6 +4,7 @@ use tauri::{
     Manager,
 };
 
+mod ai;
 mod capture;
 mod drag;
 mod hotkey;
@@ -24,7 +25,7 @@ pub fn run() {
             window::create_thumbnail_pool(app.handle())?;
 
             // System tray
-            let quit = MenuItem::with_id(app, "quit", "Quit Liem Shot", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit Liem Capture", true, None::<&str>)?;
             let show = MenuItem::with_id(app, "show", "Settings", true, None::<&str>)?;
             let capture = MenuItem::with_id(
                 app,
@@ -37,7 +38,7 @@ pub fn run() {
 
             TrayIconBuilder::new()
                 .menu(&menu)
-                .tooltip("Liem Shot. Capture. Drag. Done.")
+                .tooltip("Liem Capture. Capture. Drag. Done.")
                 .icon(app.default_window_icon().unwrap().clone())
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "quit" => app.exit(0),
@@ -85,6 +86,7 @@ pub fn run() {
             capture::get_thumbnail_data,
             capture::get_image_data,
             capture::save_edited_thumbnail,
+            capture::discard_unsaved_capture,
             capture::export_png_to_path,
             capture::list_gallery_items,
             capture::list_gallery_tree,
@@ -98,6 +100,10 @@ pub fn run() {
             capture::delete_gallery_folder,
             capture::move_gallery_item,
             capture::rename_gallery_item,
+            ai::ai_upscale_image,
+            ai::ai_remove_background,
+            ai::ai_ocr_image,
+            ai::ai_ocr_layout,
             hotkey::get_capture_hotkey,
             hotkey::set_capture_hotkey,
             hotkey::reset_capture_hotkey,

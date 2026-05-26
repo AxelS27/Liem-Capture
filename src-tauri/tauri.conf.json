@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Liem Shot",
+  "productName": "Liem Capture",
   "version": "0.1.0",
-  "identifier": "com.axels27.liem-shot",
+  "identifier": "com.axels27.liem-capture",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Liem Shot",
+        "title": "Liem Capture",
         "width": 360,
         "height": 480,
         "resizable": false,
@@ -30,7 +30,7 @@
     "trayIcon": {
       "id": "main",
       "iconPath": "icons/icon.ico",
-      "tooltip": "Liem Shot. Capture. Drag. Done.",
+      "tooltip": "Liem Capture. Capture. Drag. Done.",
       "iconAsTemplate": false
     }
   },

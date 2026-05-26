@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    liem_shot_lib::run()
+    liem_capture_lib::run()
 }
