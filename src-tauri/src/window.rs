@@ -541,7 +541,7 @@ pub fn create_overlay(app: &AppHandle) -> tauri::Result<()> {
         None => (1920.0, 1080.0, 0.0, 0.0),
     };
 
-    WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("/#/overlay".into()))
+    let overlay = WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("/#/overlay".into()))
         .title("Liem Shot Overlay")
         .inner_size(w, h)
         .position(mx, my)
@@ -555,6 +555,9 @@ pub fn create_overlay(app: &AppHandle) -> tauri::Result<()> {
         .focused(false)
         .disable_drag_drop_handler()
         .build()?;
+
+    #[cfg(debug_assertions)]
+    overlay.open_devtools();
 
     Ok(())
 }

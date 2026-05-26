@@ -21,6 +21,7 @@ interface Rect  { x: number; y: number; w: number; h: number }
 
 const SHOT_SFX_OFFSET_SECONDS = 0;
 const OVERLAY_CLOSE_MS = 130;
+const GALLERY_PREVIEW_LOADING_KEY = "liem-shot:gallery-preview-loading";
 const shotSfx = new Audio("/sfx/shot_sfx.mp3");
 shotSfx.preload = "auto";
 shotSfx.volume = 0.62;
@@ -56,6 +57,64 @@ const MODES = [
   { key: "2", label: "Fullscreen", disabled: false },
   { key: "3", label: "Scroll",     disabled: true  },
 ] as const;
+
+type GalleryPreviewLoading = "on-demand" | "auto";
+type ShortcutParts = {
+  ctrl: boolean;
+  shift: boolean;
+  alt: boolean;
+  superKey: boolean;
+  key: string;
+};
+
+const DEFAULT_HOTKEY = "Ctrl+Shift+2";
+
+function parseShortcutSpec(spec: string): ShortcutParts {
+  const parts = spec.split("+").map((part) => part.trim()).filter(Boolean);
+  const key = parts[parts.length - 1] ?? "2";
+  return {
+    ctrl: parts.some((part) => /^(ctrl|control)$/i.test(part)),
+    shift: parts.some((part) => /^shift$/i.test(part)),
+    alt: parts.some((part) => /^(alt|option)$/i.test(part)),
+    superKey: parts.some((part) => /^(super|cmd|command|win|meta)$/i.test(part)),
+    key,
+  };
+}
+
+function formatShortcutSpec(parts: ShortcutParts) {
+  return [
+    parts.ctrl ? "Ctrl" : null,
+    parts.shift ? "Shift" : null,
+    parts.alt ? "Alt" : null,
+    parts.superKey ? "Super" : null,
+    parts.key,
+  ].filter(Boolean).join("+");
+}
+
+function keyFromKeyboardEvent(event: KeyboardEvent) {
+  if (/^Key[A-Z]$/.test(event.code)) return event.code.slice(3);
+  if (/^Digit[0-9]$/.test(event.code)) return event.code.slice(5);
+  if (/^Numpad[0-9]$/.test(event.code)) return `Numpad${event.code.slice(6)}`;
+  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(event.key)) return event.key.toUpperCase();
+  const named: Record<string, string> = {
+    Escape: "Escape",
+    Space: "Space",
+    Enter: "Enter",
+    Tab: "Tab",
+    Backspace: "Backspace",
+    Delete: "Delete",
+    Insert: "Insert",
+    Home: "Home",
+    End: "End",
+    PageUp: "PageUp",
+    PageDown: "PageDown",
+    ArrowUp: "ArrowUp",
+    ArrowDown: "ArrowDown",
+    ArrowLeft: "ArrowLeft",
+    ArrowRight: "ArrowRight",
+  };
+  return named[event.key] ?? null;
+}
 
 interface GalleryItem {
   path: string;
@@ -108,6 +167,7 @@ const viewerOpenRef = { current: false };
 // Same trick for the prompt/confirm/alert dialog — when one is showing,
 // Esc / Enter belong to it, not to the overlay's mode-cancel hotkey.
 const dialogOpenRef = { current: false };
+const selectorBackRef: { current: null | (() => boolean) } = { current: null };
 
 // ─── Themed prompt / confirm / alert ─────────────────────────────────────
 // We replace the native browser dialogs (which can't be styled, blur the
@@ -444,7 +504,6 @@ function FolderTreeNode({
 function GalleryTile({
   item,
   previewB64,
-  requestPreview,
   selected,
   onPointerDown,
   onCopy,
@@ -452,17 +511,11 @@ function GalleryTile({
 }: {
   item: GalleryItem;
   previewB64?: string;
-  requestPreview: (path: string) => void;
   selected: boolean;
   onPointerDown: (item: GalleryItem, e: ReactPointerEvent) => void;
   onCopy: (item: GalleryItem, e: ReactMouseEvent) => void;
   onDelete: (item: GalleryItem, e: ReactMouseEvent) => void;
 }) {
-  useEffect(() => {
-    if (previewB64) return;
-    requestPreview(item.path);
-  }, [item.path, previewB64, requestPreview]);
-
   return (
     <button
       onPointerDown={(e) => onPointerDown(item, e)}
@@ -513,7 +566,15 @@ function GalleryTile({
   );
 }
 
-function GallerySection({ onClose, onViewItem }: { onClose: () => void; onViewItem: (item: GalleryItem) => void }) {
+function GallerySection({
+  onClose,
+  onExternalDragComplete,
+  onViewItem,
+}: {
+  onClose: () => void;
+  onExternalDragComplete: () => void;
+  onViewItem: (item: GalleryItem) => void;
+}) {
   const dialog = useDialog();
   const [tree, setTree] = useState<FolderNode | null>(null);
   const [currentPath, setCurrentPath] = useState<string | null>(null); // null = root
@@ -527,8 +588,13 @@ function GallerySection({ onClose, onViewItem }: { onClose: () => void; onViewIt
   const [metadataCache, setMetadataCache] = useState<Record<string, GalleryMetadata>>({});
   const lastClickRef = useRef<{ path: string; time: number } | null>(null);
   const previewRequests = useRef<Set<string>>(new Set());
+  const previewsRef = useRef<Record<string, string>>({});
   const hasItemsRef = useRef(false);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    previewsRef.current = previews;
+  }, [previews]);
 
   const toggleExpand = useCallback((path: string) => {
     setExpandedFolders((prev) => {
@@ -576,12 +642,29 @@ function GallerySection({ onClose, onViewItem }: { onClose: () => void; onViewIt
   }, [refreshTree, refreshItems, currentPath]);
 
   const requestPreview = useCallback((path: string) => {
-    if (previews[path] || previewRequests.current.has(path)) return;
+    if (previewsRef.current[path] || previewRequests.current.has(path)) return;
     previewRequests.current.add(path);
     invoke<string>("get_gallery_preview", { path })
-      .then((b64) => setPreviews((prev) => ({ ...prev, [path]: b64 })))
-      .catch(console.error);
-  }, [previews]);
+      .then((b64) => {
+        setPreviews((prev) => ({ ...prev, [path]: b64 }));
+      })
+      .catch((error) => {
+        previewRequests.current.delete(path);
+        console.error(error);
+      });
+  }, []);
+
+  const loadPreview = useCallback(async (path: string) => {
+    if (previewsRef.current[path] || previewRequests.current.has(path)) return;
+    previewRequests.current.add(path);
+    try {
+      const b64 = await invoke<string>("get_gallery_preview", { path });
+      setPreviews((prev) => ({ ...prev, [path]: b64 }));
+    } catch (error) {
+      previewRequests.current.delete(path);
+      console.error(error);
+    }
+  }, []);
 
   const requestMetadata = useCallback((path: string) => {
     if (metadataCache[path]) return;
@@ -589,6 +672,21 @@ function GallerySection({ onClose, onViewItem }: { onClose: () => void; onViewIt
       .then((meta) => setMetadataCache((prev) => ({ ...prev, [path]: meta })))
       .catch(console.error);
   }, [metadataCache]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      for (const item of items) {
+        if (cancelled) return;
+        await loadPreview(item.path);
+        await new Promise((resolve) => window.setTimeout(resolve, 35));
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [items, loadPreview]);
 
   const openInEditor = useCallback((item: GalleryItem) => {
     void invoke("open_gallery_item", { path: item.path }).catch(console.error);
@@ -720,13 +818,13 @@ function GallerySection({ onClose, onViewItem }: { onClose: () => void; onViewIt
   const launchExternalDrag = useCallback(async (item: GalleryItem) => {
     await invoke("hide_overlay_for_capture").catch(() => {});
     await invoke("show_drag_cancel_target").catch(() => {});
-    let dropped = false;
     try {
-      dropped = (await invoke<boolean>("start_drag", { path: item.path })) ?? false;
+      await invoke<boolean>("start_drag", { path: item.path });
     } catch (err) { console.error(err); }
     await invoke("hide_drag_cancel_target").catch(() => {});
-    if (!dropped) await invoke("show_overlay_again").catch(() => {});
-  }, []);
+    await invoke("show_overlay_again").catch(() => {});
+    onExternalDragComplete();
+  }, [onExternalDragComplete]);
 
   const handleTilePointerDown = useCallback((item: GalleryItem, e: ReactPointerEvent) => {
     if (e.button !== 0) return;
@@ -963,7 +1061,6 @@ function GallerySection({ onClose, onViewItem }: { onClose: () => void; onViewIt
                   key={item.path}
                   item={item}
                   previewB64={previews[item.path]}
-                  requestPreview={requestPreview}
                   selected={selectedPath === item.path}
                   onPointerDown={handleTilePointerDown}
                   onCopy={handleCopy}
@@ -1121,6 +1218,7 @@ function ImageViewer({
   // firing on the same event.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if ((window as Window & { __LIEM_RECORDING_HOTKEY?: boolean }).__LIEM_RECORDING_HOTKEY) return;
       if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
@@ -1308,6 +1406,227 @@ function DragGhost({ previewB64 }: { previewB64: string }) {
   );
 }
 
+const SELECTOR_SURFACE_STYLE = {
+  background: "linear-gradient(145deg, rgba(24,24,27,0.98), rgba(12,12,14,0.98))",
+  border: "1px solid rgba(255,255,255,0.10)",
+  boxShadow: "0 26px 70px rgba(0,0,0,0.58), inset 0 1px 0 rgba(255,255,255,0.08)",
+} as const;
+
+const SELECTOR_BUTTON_CLASS =
+  "h-16 flex items-center gap-3 px-3 rounded-lg text-left transition-all border border-white/[0.08] bg-zinc-900/80 hover:bg-zinc-800/95 hover:border-white/28 hover:shadow-[0_0_0_1px_rgba(255,255,255,0.08)] active:bg-zinc-700/90";
+
+const SELECTOR_ACTION_CLASS =
+  "min-h-64 flex flex-col items-center justify-center gap-5 p-5 rounded-lg text-center transition-all border border-white/[0.08] bg-zinc-900/80 hover:bg-zinc-800/95 hover:border-white/28 active:bg-zinc-700/90";
+
+const SELECTOR_ICON_CLASS =
+  "w-6 h-6 rounded-md bg-white/[0.08] border border-white/[0.12] text-white/88 flex items-center justify-center shrink-0";
+
+function SettingsPanel({
+  previewLoading,
+  onPreviewLoadingChange,
+  hotkey,
+  onHotkeyApplied,
+}: {
+  previewLoading: GalleryPreviewLoading;
+  onPreviewLoadingChange: (value: GalleryPreviewLoading) => void;
+  hotkey: string;
+  onHotkeyApplied: (value: string) => void;
+}) {
+  const [tab, setTab] = useState<"hotkey" | "preferences">("hotkey");
+  const [draftHotkey, setDraftHotkey] = useState(hotkey);
+  const [recording, setRecording] = useState<"combo" | "key" | null>(null);
+  const [hotkeyStatus, setHotkeyStatus] = useState("");
+
+  useEffect(() => {
+    setDraftHotkey(hotkey);
+  }, [hotkey]);
+
+  useEffect(() => {
+    if (!recording) return;
+    const recordingWindow = window as Window & { __LIEM_RECORDING_HOTKEY?: boolean };
+    recordingWindow.__LIEM_RECORDING_HOTKEY = true;
+    const onKey = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      const key = keyFromKeyboardEvent(event);
+      if (!key) return;
+      const current = parseShortcutSpec(draftHotkey);
+      const next: ShortcutParts = recording === "combo"
+        ? {
+            ctrl: event.ctrlKey,
+            shift: event.shiftKey,
+            alt: event.altKey,
+            superKey: event.metaKey,
+            key,
+          }
+        : { ...current, key };
+      setDraftHotkey(formatShortcutSpec(next));
+      setRecording(null);
+      setHotkeyStatus("");
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      recordingWindow.__LIEM_RECORDING_HOTKEY = false;
+      window.removeEventListener("keydown", onKey, true);
+    };
+  }, [draftHotkey, recording]);
+
+  const draftParts = useMemo(() => parseShortcutSpec(draftHotkey), [draftHotkey]);
+
+  const toggleModifier = useCallback((modifier: keyof Omit<ShortcutParts, "key">) => {
+    const parts = parseShortcutSpec(draftHotkey);
+    parts[modifier] = !parts[modifier];
+    setDraftHotkey(formatShortcutSpec(parts));
+    setHotkeyStatus("");
+  }, [draftHotkey]);
+
+  const applyHotkey = useCallback(async () => {
+    try {
+      const applied = await invoke<string>("set_capture_hotkey", { shortcut: draftHotkey });
+      onHotkeyApplied(applied);
+      setDraftHotkey(applied);
+      setHotkeyStatus("Applied");
+    } catch (error) {
+      setHotkeyStatus(String(error));
+    }
+  }, [draftHotkey, onHotkeyApplied]);
+
+  const resetHotkey = useCallback(async () => {
+    try {
+      const reset = await invoke<string>("reset_capture_hotkey");
+      onHotkeyApplied(reset);
+      setDraftHotkey(reset);
+      setHotkeyStatus("Reset");
+    } catch (error) {
+      setHotkeyStatus(String(error));
+    }
+  }, [onHotkeyApplied]);
+
+  return (
+    <div className="flex flex-col">
+      <div className="px-4 pt-4 pb-2 flex items-center gap-4 border-b border-white/12">
+        <span className="text-white/92 font-semibold text-sm tracking-tight">Settings</span>
+      </div>
+      <div className="flex" style={{ minHeight: 440 }}>
+        <aside className="w-48 shrink-0 border-r border-white/12 p-2 flex flex-col gap-1">
+          {[
+            ["hotkey", "Hotkey"],
+            ["preferences", "Preferences"],
+          ].map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setTab(key as "hotkey" | "preferences")}
+              className={[
+                "h-10 px-3 rounded-lg text-left text-xs font-semibold transition-colors",
+                tab === key
+                  ? "bg-white/[0.12] text-white"
+                  : "text-white/58 hover:text-white/90 hover:bg-white/[0.06]",
+              ].join(" ")}
+            >
+              {label}
+            </button>
+          ))}
+        </aside>
+        <section className="flex-1 min-w-0 p-4">
+          {tab === "hotkey" ? (
+            <div className="flex flex-col gap-4">
+              <div>
+                <div className="text-white/85 text-xs font-semibold mb-3">Capture shortcut</div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {[
+                    ["ctrl", "Ctrl"],
+                    ["shift", "Shift"],
+                    ["alt", "Alt"],
+                    ["superKey", "Super"],
+                  ].map(([key, label]) => {
+                    const active = draftParts[key as keyof Omit<ShortcutParts, "key">];
+                    return (
+                      <button
+                        key={key}
+                        onClick={() => toggleModifier(key as keyof Omit<ShortcutParts, "key">)}
+                        className={[
+                          "px-2.5 py-1.5 rounded-md text-xs font-mono border shadow-sm transition-colors",
+                          active
+                            ? "bg-white/[0.14] text-white border-white/[0.18]"
+                            : "bg-zinc-900 text-white/38 border-white/[0.08] hover:text-white/75",
+                        ].join(" ")}
+                      >
+                        {label}
+                      </button>
+                    );
+                  })}
+                  <button
+                    onClick={() => setRecording("key")}
+                    className={[
+                      "px-2.5 py-1.5 rounded-md text-xs font-mono border shadow-sm transition-colors",
+                      recording === "key"
+                        ? "bg-white/[0.22] text-white border-white/30"
+                        : "bg-zinc-900 text-white/88 border-white/[0.12] hover:bg-zinc-800",
+                    ].join(" ")}
+                  >
+                    {recording === "key" ? "Press key" : draftParts.key}
+                  </button>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => {
+                    setRecording("combo");
+                    setHotkeyStatus("");
+                  }}
+                  className="h-8 px-3 rounded-lg border border-white/[0.10] bg-zinc-900/80 hover:bg-zinc-800/95 text-white/86 text-xs font-semibold transition-colors"
+                >
+                  {recording === "combo" ? "Press shortcut" : "Record"}
+                </button>
+                <button
+                  onClick={() => void applyHotkey()}
+                  disabled={draftHotkey === hotkey}
+                  className="h-8 px-3 rounded-lg border border-white/[0.12] bg-white/[0.12] hover:bg-white/[0.18] text-white text-xs font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  Apply
+                </button>
+                <button
+                  onClick={() => void resetHotkey()}
+                  className="h-8 px-3 rounded-lg border border-white/[0.10] bg-zinc-900/80 hover:bg-zinc-800/95 text-white/72 text-xs font-semibold transition-colors"
+                >
+                  Reset
+                </button>
+                {hotkeyStatus && (
+                  <span className="text-[11px] text-white/48">{hotkeyStatus}</span>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div>
+              <div className="text-white/85 text-xs font-semibold mb-3">Gallery previews</div>
+              <div className="inline-flex rounded-lg border border-white/[0.08] bg-zinc-950/70 p-1">
+                {[
+                  ["on-demand", "On demand"],
+                  ["auto", "Automatically"],
+                ].map(([value, label]) => (
+                  <button
+                    key={value}
+                    onClick={() => onPreviewLoadingChange(value as GalleryPreviewLoading)}
+                    className={[
+                      "h-9 px-3 rounded-lg text-xs font-semibold transition-colors",
+                      previewLoading === value
+                        ? "bg-white/[0.14] text-white"
+                        : "text-white/58 hover:text-white/90 hover:bg-white/[0.06]",
+                    ].join(" ")}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </section>
+      </div>
+    </div>
+  );
+}
+
 function ModeSelector({
   isClosing,
   onSelect,
@@ -1318,12 +1637,50 @@ function ModeSelector({
   onClose: () => void;
 }) {
   const [viewingItem, setViewingItem] = useState<GalleryItem | null>(null);
+  const [selectorView, setSelectorView] = useState<"menu" | "gallery" | "settings">("menu");
+  // Arrow-key focus tracking for the main menu. Covers all 5 actionable
+  // tiles: 3 mode buttons (Area/Fullscreen/Scroll) + Gallery + Settings.
+  // Default focus is the first non-disabled mode.
+  const [focusedKey, setFocusedKey] = useState<string>(() => {
+    const first = MODES.findIndex((m) => !m.disabled);
+    return first === -1 ? "gallery" : `mode-${first + 1}`;
+  });
+  const [previewLoading, setPreviewLoading] = useState<GalleryPreviewLoading>(() => {
+    return window.localStorage.getItem(GALLERY_PREVIEW_LOADING_KEY) === "auto" ? "auto" : "on-demand";
+  });
+  const [hotkey, setHotkey] = useState(DEFAULT_HOTKEY);
 
   // If the user closes the overlay while viewing, clear the viewer so the
   // next time they hit Ctrl+Shift+2 we land on the selector again.
   useEffect(() => {
-    if (isClosing) setViewingItem(null);
+    if (isClosing) {
+      setViewingItem(null);
+      setSelectorView("menu");
+    }
   }, [isClosing]);
+
+  useEffect(() => {
+    invoke<string>("get_capture_hotkey")
+      .then(setHotkey)
+      .catch(() => setHotkey(DEFAULT_HOTKEY));
+  }, []);
+
+  useEffect(() => {
+    selectorBackRef.current = () => {
+      if (viewingItem || selectorView === "menu") return false;
+      setSelectorView("menu");
+      return true;
+    };
+
+    return () => {
+      selectorBackRef.current = null;
+    };
+  }, [selectorView, viewingItem]);
+
+
+  // (Esc-back handling lives in Overlay's main keydown handler, which
+  // is what actually consumes the event. selectorBackRef closes over
+  // setSelectorView and the latest selectorView / viewingItem values.)
 
   const handleViewItem = useCallback((item: GalleryItem) => {
     setViewingItem(item);
@@ -1332,6 +1689,72 @@ function ModeSelector({
   const handleCloseViewer = useCallback(() => {
     setViewingItem(null);
   }, []);
+
+  const handlePreviewLoadingChange = useCallback((value: GalleryPreviewLoading) => {
+    setPreviewLoading(value);
+    window.localStorage.setItem(GALLERY_PREVIEW_LOADING_KEY, value);
+  }, []);
+
+  // Keyboard navigation for the main menu. Layout:
+  //   row 0: [mode-1] [mode-2] [mode-3]
+  //   row 1: [gallery] [settings]
+  // ←/→ cycles within the current row (skipping disabled). ↑/↓ jumps to
+  // the other row, picking the column closest to where the focus was.
+  // Enter triggers the focused tile. Only fires while we're actually on
+  // the main menu and no view/dialog is layered above.
+  useEffect(() => {
+    if (viewingItem || selectorView !== "menu") return;
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+
+      type Item = { id: string; row: number; col: number; disabled: boolean; action: () => void };
+      const items: Item[] = [
+        { id: "mode-1", row: 0, col: 0, disabled: MODES[0].disabled, action: () => onSelect(MODES[0].key) },
+        { id: "mode-2", row: 0, col: 1, disabled: MODES[1].disabled, action: () => onSelect(MODES[1].key) },
+        { id: "mode-3", row: 0, col: 2, disabled: MODES[2].disabled, action: () => onSelect(MODES[2].key) },
+        { id: "gallery", row: 1, col: 0, disabled: false, action: () => setSelectorView("gallery") },
+        { id: "settings", row: 1, col: 1, disabled: false, action: () => setSelectorView("settings") },
+      ];
+      const current = items.find((it) => it.id === focusedKey) ?? items[0];
+
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        e.preventDefault();
+        e.stopPropagation();
+        const delta = e.key === "ArrowLeft" ? -1 : 1;
+        const sameRow = items.filter((it) => it.row === current.row && !it.disabled);
+        if (sameRow.length === 0) return;
+        const idx = sameRow.findIndex((it) => it.id === current.id);
+        const nextIdx = (Math.max(0, idx) + delta + sameRow.length) % sameRow.length;
+        setFocusedKey(sameRow[nextIdx].id);
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        e.stopPropagation();
+        if (current.row === 1) return;
+        // Top → bottom: cols 0/1 land on Gallery, col 2 lands on Settings.
+        setFocusedKey(current.col === 2 ? "settings" : "gallery");
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        e.stopPropagation();
+        if (current.row === 0) return;
+        // Bottom → top: Gallery → first enabled mode, Settings → 2nd
+        // enabled mode (or first if 2nd is disabled).
+        const enabledModes = items.filter((it) => it.row === 0 && !it.disabled);
+        if (enabledModes.length === 0) return;
+        const target = current.col === 0
+          ? enabledModes[0]
+          : enabledModes[Math.min(1, enabledModes.length - 1)];
+        setFocusedKey(target.id);
+      } else if (e.key === "Enter") {
+        if (current.disabled) return;
+        e.preventDefault();
+        e.stopPropagation();
+        current.action();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [focusedKey, onSelect, selectorView, viewingItem]);
 
   return (
     <motion.div
@@ -1353,6 +1776,7 @@ function ModeSelector({
         ) : (
           <>
             {/* Card 1 — capture mode selector */}
+            {selectorView === "menu" && (
             <motion.div
               initial={{ opacity: 0, y: -8 }}
               animate={{ opacity: isClosing ? 0 : 1, y: 0 }}
@@ -1360,45 +1784,77 @@ function ModeSelector({
                 opacity: { duration: isClosing ? 0 : 0.12, ease: "easeOut" },
                 y: { duration: 0.18, ease: "easeOut" },
               }}
-              className="w-full rounded-[16px] overflow-hidden"
-              style={{
-                background: "rgba(255,255,255,0.08)",
-                border: "2px solid rgba(255,255,255,0.78)",
-                boxShadow: "0 18px 48px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.32)",
-                backdropFilter: "blur(24px) saturate(1.35)",
-                WebkitBackdropFilter: "blur(24px) saturate(1.35)",
-              }}
+              className="w-full rounded-xl overflow-hidden"
+              style={SELECTOR_SURFACE_STYLE}
             >
               <div className="px-4 pt-4 pb-2 flex items-center gap-4">
-                <span className="text-white font-semibold text-sm tracking-tight drop-shadow-sm">Capture mode</span>
+                <span className="text-white/92 font-semibold text-sm tracking-tight">Capture mode</span>
               </div>
 
               <div className="px-3 pb-3 grid grid-cols-3 gap-2">
-                {MODES.map((m) => (
+                {MODES.map((m, i) => {
+                  const focused = focusedKey === `mode-${i + 1}`;
+                  return (
                   <button
                     key={m.key}
                     disabled={m.disabled}
                     onClick={() => !m.disabled && onSelect(m.key)}
+                    onMouseEnter={() => !m.disabled && setFocusedKey(`mode-${i + 1}`)}
                     className={[
-                      "h-16 flex items-center gap-3 px-3 rounded-xl text-left transition-all border",
-                      m.disabled
-                        ? "opacity-45 cursor-not-allowed border-white/34 bg-black/[0.10]"
-                        : "cursor-pointer border-white/60 bg-black/[0.16] hover:bg-white/[0.13] hover:border-white/80 active:bg-white/[0.18]",
+                      SELECTOR_BUTTON_CLASS,
+                      m.disabled ? "opacity-45 cursor-not-allowed" : "cursor-pointer",
+                      focused ? "ring-2 ring-white/55 border-white/30 bg-zinc-800/95" : "",
                     ].join(" ")}
                   >
-                    <kbd className="w-6 h-6 rounded-md bg-white/16 border border-white/22 text-white/90 text-xs font-mono flex items-center justify-center shrink-0 shadow-sm">
+                    <kbd className={SELECTOR_ICON_CLASS + " text-xs font-mono shadow-sm"}>
                       {m.key}
                     </kbd>
                     <span className="text-white text-sm font-semibold drop-shadow-sm min-w-0 truncate">{m.label}</span>
                     {m.disabled && (
-                      <span className="ml-auto text-[10px] text-white/65 bg-white/10 border border-white/14 px-1.5 py-0.5 rounded-full">soon</span>
+                      <span className="ml-auto text-[10px] text-white/58 bg-white/[0.06] border border-white/[0.08] px-1.5 py-0.5 rounded-full">soon</span>
                     )}
                   </button>
-                ))}
+                  );
+                })}
+              </div>
+              <div className="px-3 pb-3 grid grid-cols-2 gap-2 border-t border-white/[0.07] pt-3">
+                <button
+                  onClick={() => setSelectorView("gallery")}
+                  onMouseEnter={() => setFocusedKey("gallery")}
+                  className={[
+                    SELECTOR_ACTION_CLASS,
+                    focusedKey === "gallery" ? "ring-2 ring-white/55 border-white/30 bg-zinc-800/95" : "",
+                  ].join(" ")}
+                >
+                  <span className="w-16 h-16 rounded-2xl bg-white/[0.08] border border-white/[0.12] text-white/88 flex items-center justify-center">
+                    <svg width="34" height="34" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <path d="M4 6a2 2 0 012-2h12a2 2 0 012 2v12a2 2 0 01-2 2H6a2 2 0 01-2-2V6z" stroke="currentColor" strokeWidth="1.8" />
+                      <path d="M8 14l2.2-2.2 2 2L15 11l3 4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </span>
+                  <span className="text-white text-lg font-semibold">Gallery</span>
+                </button>
+                <button
+                  onClick={() => setSelectorView("settings")}
+                  onMouseEnter={() => setFocusedKey("settings")}
+                  className={[
+                    SELECTOR_ACTION_CLASS,
+                    focusedKey === "settings" ? "ring-2 ring-white/55 border-white/30 bg-zinc-800/95" : "",
+                  ].join(" ")}
+                >
+                  <span className="w-16 h-16 rounded-2xl bg-white/[0.08] border border-white/[0.12] text-white/88 flex items-center justify-center">
+                    <svg width="34" height="34" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <path d="M12 15.5a3.5 3.5 0 100-7 3.5 3.5 0 000 7z" stroke="currentColor" strokeWidth="1.8" />
+                      <path d="M19 12a7 7 0 01-.1 1.2l2 1.5-2 3.4-2.4-1a7 7 0 01-2 1.1L14.2 21h-4.4l-.3-2.8a7 7 0 01-2-1.1l-2.4 1-2-3.4 2-1.5A7 7 0 015 12c0-.4 0-.8.1-1.2l-2-1.5 2-3.4 2.4 1a7 7 0 012-1.1L9.8 3h4.4l.3 2.8a7 7 0 012 1.1l2.4-1 2 3.4-2 1.5c.1.4.1.8.1 1.2z" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" />
+                    </svg>
+                  </span>
+                  <span className="text-white text-lg font-semibold">Settings</span>
+                </button>
               </div>
             </motion.div>
 
-            {/* Card 2 — gallery (tree + grid + right info panel) */}
+            )}
+            {selectorView === "gallery" && (
             <motion.div
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: isClosing ? 0 : 1, y: 0 }}
@@ -1406,17 +1862,51 @@ function ModeSelector({
                 opacity: { duration: isClosing ? 0 : 0.14, ease: "easeOut", delay: isClosing ? 0 : 0.04 },
                 y: { duration: 0.2, ease: "easeOut" },
               }}
-              className="w-full rounded-[16px] overflow-hidden"
-              style={{
-                background: "rgba(255,255,255,0.08)",
-                border: "2px solid rgba(255,255,255,0.78)",
-                boxShadow: "0 18px 48px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.32)",
-                backdropFilter: "blur(24px) saturate(1.35)",
-                WebkitBackdropFilter: "blur(24px) saturate(1.35)",
-              }}
+              className="w-full rounded-xl overflow-hidden"
+              style={SELECTOR_SURFACE_STYLE}
             >
-              <GallerySection onClose={onClose} onViewItem={handleViewItem} />
+              <div className="px-3 pt-3">
+                <button
+                  onClick={() => setSelectorView("menu")}
+                  className="h-8 px-2.5 rounded-lg border border-white/[0.08] bg-zinc-900/80 hover:bg-zinc-800/95 text-white/82 text-xs font-semibold transition-colors"
+                >
+                  Back
+                </button>
+              </div>
+              <GallerySection
+                onClose={onClose}
+                onExternalDragComplete={() => setSelectorView("gallery")}
+                onViewItem={handleViewItem}
+              />
             </motion.div>
+            )}
+            {selectorView === "settings" && (
+            <motion.div
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: isClosing ? 0 : 1, y: 0 }}
+              transition={{
+                opacity: { duration: isClosing ? 0 : 0.14, ease: "easeOut" },
+                y: { duration: 0.2, ease: "easeOut" },
+              }}
+              className="w-full rounded-xl overflow-hidden"
+              style={SELECTOR_SURFACE_STYLE}
+            >
+              <div className="px-3 pt-3">
+                <button
+                  onClick={() => setSelectorView("menu")}
+                  className="h-8 px-2.5 rounded-lg border border-white/[0.08] bg-zinc-900/80 hover:bg-zinc-800/95 text-white/82 text-xs font-semibold transition-colors"
+                >
+                  Back
+                </button>
+              </div>
+              <SettingsPanel
+                previewLoading={previewLoading}
+                onPreviewLoadingChange={handlePreviewLoadingChange}
+                hotkey={hotkey}
+                onHotkeyApplied={setHotkey}
+              />
+            </motion.div>
+            )}
           </>
         )}
       </div>
@@ -1432,6 +1922,11 @@ export default function Overlay() {
   const rafRef     = useRef<number>(0);
   const modeRef    = useRef<Mode>("select");
   const closeTimerRef = useRef<number | null>(null);
+  // Time (performance.now) before which Esc keydowns are ignored.
+  // Set whenever we successfully back-navigate (selectorBackRef returned
+  // true) so an OS-level second keydown — auto-repeat or a hardware
+  // double-fire — can't accidentally close the overlay.
+  const escCloseSuppressedUntilRef = useRef(0);
   const [mode, setMode] = useState<Mode>("select");
   const [overlayClosing, setOverlayClosing] = useState(false);
   const [selectorClosing, setSelectorClosing] = useState(false);
@@ -1482,6 +1977,21 @@ export default function Overlay() {
     }, OVERLAY_CLOSE_MS);
   }, []);
 
+  const handleEscapeRequest = useCallback(() => {
+    if (viewerOpenRef.current || dialogOpenRef.current) return;
+
+    if (performance.now() < escCloseSuppressedUntilRef.current) {
+      return;
+    }
+
+    if (selectorBackRef.current?.()) {
+      escCloseSuppressedUntilRef.current = performance.now() + 600;
+      return;
+    }
+
+    close();
+  }, [close]);
+
   // Reset when overlay is re-shown
   useEffect(() => {
     const unlisten = listen("reset-overlay", () => {
@@ -1501,10 +2011,10 @@ export default function Overlay() {
 
   useEffect(() => {
     const unlisten = listen("close-overlay", () => {
-      close();
+      handleEscapeRequest();
     });
     return () => { unlisten.then((fn) => fn()); };
-  }, [close]);
+  }, [handleEscapeRequest]);
 
   // Size canvas when entering crop mode
   useEffect(() => {
@@ -1534,14 +2044,24 @@ export default function Overlay() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        // If the inline image viewer or a styled dialog is open, let
-        // them handle Esc. Their own listeners call
-        // stopImmediatePropagation so we won't see this event, but as a
-        // belt-and-braces guard we also check the flags.
         if (viewerOpenRef.current || dialogOpenRef.current) return;
+        // Swallow auto-repeat and follow-up Esc events for a short
+        // grace period after a successful back-to-menu. Without this a
+        // single press that happens to dispatch two keydowns (OS quirk
+        // / accidental double-tap) cascades into close().
+        if (e.repeat) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        if (performance.now() < escCloseSuppressedUntilRef.current) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
         e.preventDefault();
         e.stopPropagation();
-        close();              // synchronous, always works
+        handleEscapeRequest();
         return;
       }
       if (modeRef.current === "select") {
@@ -1555,7 +2075,7 @@ export default function Overlay() {
     };
     window.addEventListener("keydown", onKey, true); // capture phase = fires first
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [close, handleModeSelect]);
+  }, [handleEscapeRequest, handleModeSelect]);
 
   // ── Crop mouse handlers ────────────────────────────────────────────────────
   useEffect(() => {

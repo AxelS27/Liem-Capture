@@ -444,7 +444,7 @@ fn open_gallery_item_inner(app: AppHandle, path: String, event: &'static str) ->
     Ok(())
 }
 
-fn save_png_fast(path: &Path, img: &image::RgbaImage) -> Result<(), String> {
+fn save_png_compressed(path: &Path, img: &image::RgbaImage) -> Result<(), String> {
     use image::{
         codecs::png::{CompressionType, FilterType, PngEncoder},
         ColorType, ImageEncoder,
@@ -452,7 +452,7 @@ fn save_png_fast(path: &Path, img: &image::RgbaImage) -> Result<(), String> {
 
     let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
     let writer = BufWriter::new(file);
-    PngEncoder::new_with_quality(writer, CompressionType::Fast, FilterType::NoFilter)
+    PngEncoder::new_with_quality(writer, CompressionType::Fast, FilterType::Adaptive)
         .write_image(
             img.as_raw(),
             img.width(),
@@ -541,7 +541,7 @@ pub fn export_png_to_path(path: String, data_url: String) -> Result<(), String> 
     let img = image::load_from_memory(&bytes)
         .map_err(|e| e.to_string())?
         .to_rgba8();
-    save_png_fast(Path::new(&path), &img)
+    save_png_compressed(Path::new(&path), &img)
 }
 
 #[command]
@@ -669,7 +669,7 @@ pub fn save_edited_thumbnail(
         candidate
     };
 
-    save_png_fast(&final_path, &img)?;
+    save_png_compressed(&final_path, &img)?;
     // If the user picked a different folder, the original file in the
     // old location is now stale — remove it so we don't leave duplicates
     // scattered around the gallery.
@@ -731,11 +731,10 @@ pub fn take_screenshot(
         .unwrap_or_default()
         .as_millis();
     let path = gallery_dir(&app).join(format!("shot_{ts}.png"));
-    save_png_fast(&path, &cropped)?;
-
     let path_str = path.to_string_lossy().to_string();
     let idx = window::reserve_thumbnail_index();
     push_thumbnail(&app, path_str.clone(), &cropped, idx);
+    save_png_compressed(&path, &cropped)?;
     let _ = copy_rgba_to_clipboard(&cropped);
 
     Ok(path_str)
@@ -755,11 +754,10 @@ pub fn take_fullscreen(app: AppHandle) -> Result<String, String> {
         .unwrap_or_default()
         .as_millis();
     let path = gallery_dir(&app).join(format!("shot_{ts}.png"));
-    save_png_fast(&path, &image)?;
-
     let path_str = path.to_string_lossy().to_string();
     let idx = window::reserve_thumbnail_index();
     push_thumbnail(&app, path_str.clone(), &image, idx);
+    save_png_compressed(&path, &image)?;
     let _ = copy_rgba_to_clipboard(&image);
 
     Ok(path_str)

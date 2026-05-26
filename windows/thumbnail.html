@@ -776,6 +776,12 @@
         grid-template-columns: repeat(3, 1fr);
         gap: 8px;
       }
+      .picker-grid.is-prompt {
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
       .picker-tile {
         aspect-ratio: 3 / 2;
         overflow: hidden;
@@ -882,6 +888,46 @@
         font-size: 11px;
         text-align: center;
         padding: 24px 0;
+      }
+      .picker-empty-text {
+        max-width: 260px;
+        margin: 0 auto 12px;
+        line-height: 1.45;
+      }
+      .picker-inline-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        height: 30px;
+        padding: 0 12px;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        background: rgba(255, 255, 255, 0.1);
+        color: rgba(255, 255, 255, 0.88);
+        font-size: 11px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .picker-inline-btn:hover {
+        background: rgba(255, 255, 255, 0.18);
+        color: rgba(255, 255, 255, 1);
+      }
+      .picker-load-more {
+        grid-column: 1 / -1;
+        justify-self: center;
+        height: 30px;
+        padding: 0 14px;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        background: rgba(255, 255, 255, 0.09);
+        color: rgba(255, 255, 255, 0.82);
+        font-size: 11px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .picker-load-more:hover {
+        background: rgba(255, 255, 255, 0.17);
+        color: rgba(255, 255, 255, 1);
       }
 
       .picker-footer {

@@ -952,6 +952,16 @@ function resetTimer(durationMs = DISMISS_MS) {
   runTimer();
 }
 
+function resetAndPauseTimer(durationMs = DISMISS_MS) {
+  if (isPinned) return;
+
+  clearHideTimeout();
+  timerDurationMs = durationMs;
+  remainingMs = durationMs;
+  timerPaused = true;
+  setProgress(1);
+}
+
 async function hideThumbnail() {
   if (isDismissing) return;
 
@@ -1914,6 +1924,7 @@ clearButton.addEventListener("click", () => {
 // most recent destination is the default.
 const LAST_GALLERY_FOLDER_KEY = "liem-shot:last-gallery-folder";
 const LAST_SAVE_AS_DIR_KEY = "liem-shot:last-save-as-dir";
+const GALLERY_PREVIEW_LOADING_KEY = "liem-shot:gallery-preview-loading";
 const saveMenu = document.querySelector<HTMLDivElement>("#save-menu")!;
 
 interface SaveFolderNode {
@@ -1981,8 +1992,16 @@ let pickerTree: SaveFolderNode | null = null;
 let pickerSelectedPath: string = ""; // "" = gallery root
 let pickerExpandedFolders: Set<string> = new Set();
 let pickerSelectedItem: string | null = null;
+let pickerFilesVisiblePath: string | null = null;
+let pickerVisibleItemCount = 0;
+let pickerPromptRequestId = 0;
 const pickerPreviewCache: Map<string, string> = new Map();
 const pickerMetadataCache: Map<string, GalleryMetadata> = new Map();
+const PICKER_ITEM_CHUNK_SIZE = 12;
+
+function shouldAutoLoadPickerFiles() {
+  return window.localStorage.getItem(GALLERY_PREVIEW_LOADING_KEY) === "auto";
+}
 
 interface PickerItem { path: string; name: string }
 interface GalleryMetadata {
@@ -2203,7 +2222,7 @@ async function handleTreeRename(path: string) {
     }
     await refreshPickerTree();
     updatePickerCurrentLabel();
-    void renderPickerGrid();
+    refreshPickerGridView();
   } catch (error) {
     await pickerDialog({ title: "Could not rename", message: String(error), prompt: false });
   }
@@ -2226,7 +2245,7 @@ async function handleTreeDelete(path: string) {
     pickerExpandedFolders.delete(path);
     await refreshPickerTree();
     updatePickerCurrentLabel();
-    void renderPickerGrid();
+    refreshPickerGridView();
   } catch (error) {
     await pickerDialog({ title: "Could not delete", message: String(error), prompt: false });
   }
@@ -2240,6 +2259,40 @@ function togglePickerExpand(path: string) {
   if (pickerExpandedFolders.has(key)) pickerExpandedFolders.delete(key);
   else pickerExpandedFolders.add(key);
   renderPickerTree();
+}
+
+async function renderPickerBrowsePrompt() {
+  const requestId = ++pickerPromptRequestId;
+  const folder = pickerSelectedPath;
+  pickerGridEl.classList.add("is-prompt");
+  pickerGridEl.innerHTML = `<div class="picker-empty"><div class="picker-empty-text">Checking folder...</div></div>`;
+
+  try {
+    const items = await invoke<PickerItem[]>("list_gallery_items", {
+      folder: folder === "" ? null : folder,
+    });
+    if (requestId !== pickerPromptRequestId || folder !== pickerSelectedPath) return;
+
+    if (items.length === 0) {
+      pickerGridEl.innerHTML = `<div class="picker-empty"><div class="picker-empty-text">This folder is empty.</div></div>`;
+      return;
+    }
+
+    pickerGridEl.innerHTML = `
+      <div class="picker-empty">
+        <div class="picker-empty-text">${items.length} item${items.length === 1 ? "" : "s"} in this folder.</div>
+        <button class="picker-inline-btn" data-picker-grid-action="show-files">Show files</button>
+      </div>`;
+  } catch (error) {
+    console.error(error);
+    if (requestId !== pickerPromptRequestId || folder !== pickerSelectedPath) return;
+    pickerGridEl.innerHTML = `<div class="picker-empty"><div class="picker-empty-text">Could not check folder.</div></div>`;
+  }
+}
+
+function refreshPickerGridView() {
+  if (pickerFilesVisiblePath === pickerSelectedPath) void renderPickerGrid();
+  else void renderPickerBrowsePrompt();
 }
 
 // Single delegated handler covers every tree-row interaction. The
@@ -2263,13 +2316,19 @@ pickerTreeEl.addEventListener("click", (event) => {
   // Default = row click = select folder.
   if (path !== pickerSelectedPath) {
     pickerSelectedPath = path;
+    pickerSelectedItem = null;
+    pickerFilesVisiblePath = shouldAutoLoadPickerFiles() ? pickerSelectedPath : null;
+    pickerVisibleItemCount = PICKER_ITEM_CHUNK_SIZE;
     renderPickerTree();
+    renderPickerInfo();
     updatePickerCurrentLabel();
-    void renderPickerGrid();
+    refreshPickerGridView();
   }
 });
 
 async function renderPickerGrid() {
+  pickerPromptRequestId += 1;
+  pickerGridEl.classList.remove("is-prompt");
   pickerGridEl.innerHTML = `<div class="picker-empty">Loading…</div>`;
   let items: PickerItem[] = [];
   try {
@@ -2295,17 +2354,22 @@ async function renderPickerGrid() {
     pickerGridEl.innerHTML = `<div class="picker-empty">Folder is empty</div>`;
     return;
   }
+  if (pickerVisibleItemCount <= 0) pickerVisibleItemCount = PICKER_ITEM_CHUNK_SIZE;
+  const visibleItems = items.slice(0, pickerVisibleItemCount);
+  const hasMore = pickerVisibleItemCount < items.length;
 
-  // Render placeholders synchronously; backfill each tile with its
-  // preview as the Rust calls land.
-  pickerGridEl.innerHTML = items
+  // Render one chunk first; preview decoding is intentionally limited to
+  // visible tiles so opening a busy folder stays responsive.
+  pickerGridEl.innerHTML = visibleItems
     .map((it) => {
       const selected = pickerSelectedItem === it.path ? " selected" : "";
       return `<div class="picker-tile${selected}" data-preview-path="${escapeHtml(it.path)}" title="${escapeHtml(it.name)}"></div>`;
     })
-    .join("");
+    .join("") + (hasMore
+      ? `<button class="picker-load-more" data-picker-grid-action="load-more">Show more</button>`
+      : "");
 
-  for (const it of items) {
+  for (const it of visibleItems) {
     const tile = pickerGridEl.querySelector<HTMLElement>(
       `[data-preview-path="${CSS.escape(it.path)}"]`,
     );
@@ -2465,6 +2529,19 @@ async function deletePickerItem(path: string) {
 
 // Click on a tile in the grid → select for info viewing.
 pickerGridEl.addEventListener("click", (event) => {
+  const action = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-picker-grid-action]");
+  if (action?.dataset.pickerGridAction === "show-files") {
+    pickerFilesVisiblePath = pickerSelectedPath;
+    pickerVisibleItemCount = PICKER_ITEM_CHUNK_SIZE;
+    void renderPickerGrid();
+    return;
+  }
+  if (action?.dataset.pickerGridAction === "load-more") {
+    pickerVisibleItemCount += PICKER_ITEM_CHUNK_SIZE;
+    void renderPickerGrid();
+    return;
+  }
+
   const tile = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-preview-path]");
   if (!tile) return;
   const path = tile.dataset.previewPath ?? "";
@@ -2576,6 +2653,8 @@ async function openSavePicker() {
     autoExpandAncestors(pickerTree.path, pickerSelectedPath);
   }
   pickerSelectedItem = null;
+  pickerFilesVisiblePath = shouldAutoLoadPickerFiles() ? pickerSelectedPath : null;
+  pickerVisibleItemCount = PICKER_ITEM_CHUNK_SIZE;
   // Pre-fill the filename input with the current file's name (without
   // the .png extension — that's added as a static suffix in the UI).
   const baseName = fileBaseName(filePath);
@@ -2585,7 +2664,7 @@ async function openSavePicker() {
   renderPickerTree();
   renderPickerInfo();
   updatePickerCurrentLabel();
-  void renderPickerGrid();
+  refreshPickerGridView();
   pickerOverlay.hidden = false;
   // Focus + select the name input so users can immediately type a new
   // name or hit Enter to accept the default.
@@ -2788,8 +2867,8 @@ listen<string>("liem-thumbnail-auto-view", (event) => {
   void enterPreviewMode(true);
 }).catch(console.error);
 
-// Hover refresh: while the cursor sits on the thumbnail we freeze the
-// countdown; when it leaves we restart the full DISMISS_MS lifetime. This is
+// Hover refresh: while the cursor sits on the thumbnail we refill and freeze
+// the countdown; when it leaves we run the full DISMISS_MS lifetime. This is
 // the only path that extends a thumbnail's life — taking a new screenshot no
 // longer resets sibling thumbnails.
 //
@@ -2809,14 +2888,14 @@ listen("liem-thumbnail-reflow", () => {
 shell.addEventListener("mouseenter", () => {
   if (performance.now() < suppressHoverUntil) return;
   if (isPreviewMode || isDismissing || isPinned || !filePath) return;
-  pauseTimer();
+  resetAndPauseTimer(DISMISS_MS);
   void invoke("pause_thumbnail_lifetime", { label: currentWindow.label }).catch(console.error);
 });
 
 shell.addEventListener("mouseleave", () => {
   if (performance.now() < suppressHoverUntil) return;
   if (isPreviewMode || isDismissing || isPinned || !filePath) return;
-  resetTimer(DISMISS_MS);
+  resumeTimer(DISMISS_MS);
   void invoke("restart_thumbnail_lifetime", { label: currentWindow.label }).catch(console.error);
 });
 
