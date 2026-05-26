@@ -880,13 +880,23 @@ function GallerySection({ onClose, onViewItem }: { onClose: () => void; onViewIt
     return () => window.removeEventListener("keydown", onKey, true);
   }, [currentPath, dialog, handleDeleteFolder, handleRenameFolder, handleRenameItem, items, selectedPath, tree]);
 
-  // Clear stale selection when the underlying items list changes (folder
-  // switch, refresh, deletion) and the selected item no longer exists.
+  // Keep the info panel useful as soon as the gallery opens: select the
+  // first visible item by default, and move to the next item after deletes.
   useEffect(() => {
-    if (selectedPath !== null && !items.some((i) => i.path === selectedPath)) {
-      setSelectedPath(null);
+    if (items.length === 0) {
+      if (selectedPath !== null) setSelectedPath(null);
+      return;
+    }
+    if (selectedPath === null || !items.some((i) => i.path === selectedPath)) {
+      setSelectedPath(items[0].path);
     }
   }, [items, selectedPath]);
+
+  useEffect(() => {
+    if (!selectedPath) return;
+    requestPreview(selectedPath);
+    requestMetadata(selectedPath);
+  }, [requestMetadata, requestPreview, selectedPath]);
 
   const selectedMetadata = selectedPath ? metadataCache[selectedPath] : undefined;
 
@@ -965,23 +975,15 @@ function GallerySection({ onClose, onViewItem }: { onClose: () => void; onViewIt
         </div>
       </div>
 
-      {/* Right info panel — only mounted when a tile is selected. */}
-      {selectedPath && (
-        <div
-          className="w-60 shrink-0 border-l border-white/12 flex flex-col"
-          style={{ maxHeight: 520 }}
-        >
+      {/* Right info panel stays mounted so the gallery layout is complete on open. */}
+      <div
+        className="w-60 shrink-0 border-l border-white/12 flex flex-col"
+        style={{ maxHeight: 520 }}
+      >
+        {selectedPath ? (
+          <>
           <div className="flex items-center justify-between gap-2 px-3 pt-2.5 pb-1.5">
             <span className="text-white/85 text-xs font-semibold tracking-tight">Info</span>
-            <button
-              onClick={() => setSelectedPath(null)}
-              className="w-6 h-6 rounded-md hover:bg-white/15 flex items-center justify-center text-white/70 hover:text-white/95"
-              title="Close info"
-            >
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-              </svg>
-            </button>
           </div>
           <div className="px-3 pb-3 flex-1 overflow-y-auto flex flex-col gap-3">
             {/* Preview */}
@@ -1056,8 +1058,18 @@ function GallerySection({ onClose, onViewItem }: { onClose: () => void; onViewIt
               Open in editor
             </button>
           </div>
-        </div>
-      )}
+          </>
+        ) : (
+          <>
+            <div className="flex items-center justify-between gap-2 px-3 pt-2.5 pb-1.5">
+              <span className="text-white/85 text-xs font-semibold tracking-tight">Info</span>
+            </div>
+            <div className="px-3 pb-3 flex-1 flex items-center justify-center text-center text-[11px] text-white/55">
+              No screenshots in this folder
+            </div>
+          </>
+        )}
+      </div>
 
       {/* Ghost that follows the cursor during an internal drag — purely
           visual cue so the user can see what they're moving. */}
