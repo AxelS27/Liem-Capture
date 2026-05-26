@@ -90,6 +90,7 @@ const undoButton = document.querySelector<HTMLButtonElement>("#tool-undo")!;
 const redoButton = document.querySelector<HTMLButtonElement>("#tool-redo")!;
 const clearButton = document.querySelector<HTMLButtonElement>("#tool-clear")!;
 const saveButton = document.querySelector<HTMLButtonElement>("#tool-save")!;
+const saveGroup = document.querySelector<HTMLDivElement>("#save-group")!;
 
 let filePath = "";
 let imageDataUrl = "";
@@ -806,7 +807,28 @@ function renderPalette() {
   });
 }
 
+// Tracks which file's editor state is currently sitting in the canvases.
+// When the user minimizes and re-opens the same thumbnail we want to
+// keep every pixel of baseCanvas / editLayer plus the undo stack and
+// shape list so they can still undo / erase / continue editing. Only
+// when filePath changes (a fresh screenshot lands in this slot) do we
+// blow away state and load from disk.
+let loadedFilePath: string | null = null;
+// Has the user explicitly saved this thumbnail (or moved/renamed it via
+// the picker) at least once? A fresh screenshot starts with this false,
+// so "Save to gallery" stays enabled even though undoStack.length === 1.
+// After a successful save we flip it true; combined with the no-edits
+// check this is what locks the menu until the user makes a new change.
+let hasUserSaved = false;
+
 async function loadEditorCanvas() {
+  // Fast path: same file, canvases already populated, undo history alive
+  // — just redraw the composite (in case anything got hidden) and return.
+  if (loadedFilePath === filePath && editCanvas.width > 0 && undoStack.length > 0) {
+    renderComposite();
+    return;
+  }
+
   const fullImage = await invoke<string>("get_image_data", { path: filePath });
   const img = new Image();
   await new Promise<void>((resolve, reject) => {
@@ -832,6 +854,7 @@ async function loadEditorCanvas() {
   undoStack = [captureSnapshot()];
   redoStack = [];
   updateHistoryButtons();
+  loadedFilePath = filePath;
 }
 
 function clearHideTimeout() {
@@ -1001,6 +1024,8 @@ function prepareThumbnailForUpdate() {
   isEditorReady = false;
   thumbnailImageReady = false;
   drawing = false;
+  // New thumbnail data → user hasn't saved this one yet.
+  hasUserSaved = false;
   concealThumbnailShell();
   shell.classList.remove("dismissing");
   shell.classList.remove("preview-mode");
@@ -1129,6 +1154,18 @@ async function enterPreviewMode(viewOnly = false) {
 
 function exitPreviewMode() {
   if (!isPreviewMode) return;
+
+  // Mirror the current edits onto the floating thumbnail tile so the
+  // user can see what they did at a glance after minimizing. The actual
+  // editor state (baseCanvas, editLayer, shapeObjects, undoStack) stays
+  // alive in memory — loadEditorCanvas() reuses it when the user opens
+  // this thumbnail again, so undo / erase / rotate continue to work.
+  // Nothing is written to disk here; the explicit Save button is what
+  // bakes edits into the underlying PNG.
+  if (isEditorReady && undoStack.length > 1) {
+    imageDataUrl = editCanvas.toDataURL("image/png");
+    image.src = imageDataUrl;
+  }
 
   isPreviewMode = false;
   isEditorReady = false;
@@ -1859,30 +1896,820 @@ redoButton.addEventListener("click", () => {
 });
 
 clearButton.addEventListener("click", () => {
-  if (undoStack.length <= 1) return;
+  if (!isPreviewMode || !isEditorReady) return;
+  // Wipe only the marker layer (pencil / highlighter / shapes / arrows).
+  // baseCanvas is left alone, so any crop / rotate / mirror applied to
+  // the underlying image stays put. commitSnapshot is a no-op if there
+  // was nothing to clear, so spamming the button doesn't churn history.
   const before = captureSnapshot();
-  drawSnapshot(undoStack[0]);
+  shapeObjects = [];
+  previewShape = null;
+  layerContext().clearRect(0, 0, editLayer.width, editLayer.height);
+  renderComposite();
   window.setTimeout(() => commitSnapshot(before), 0);
 });
 
-saveButton.addEventListener("click", async () => {
-  if (!filePath || !isPreviewMode || !isEditorReady) return;
+// Persistent preferences across edit sessions — both keys live in
+// localStorage so the next time the user pops open the save menu their
+// most recent destination is the default.
+const LAST_GALLERY_FOLDER_KEY = "liem-shot:last-gallery-folder";
+const LAST_SAVE_AS_DIR_KEY = "liem-shot:last-save-as-dir";
+const saveMenu = document.querySelector<HTMLDivElement>("#save-menu")!;
 
+interface SaveFolderNode {
+  name: string;
+  path: string;
+  children: SaveFolderNode[];
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function fileFolder(p: string): string {
+  const slash = Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/"));
+  return slash >= 0 ? p.slice(0, slash) : "";
+}
+
+function fileBaseName(p: string): string {
+  const slash = Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/"));
+  return slash >= 0 ? p.slice(slash + 1) : p;
+}
+
+function renderSaveRootMenu() {
+  // Lock "Save to gallery" only when the user has already saved this
+  // thumbnail at least once AND made no changes since. A fresh
+  // screenshot (hasUserSaved = false) stays unlocked so the user can
+  // still open the picker to move it into a sub-folder.
+  // "Save as…" is always available — exporting an unchanged copy
+  // somewhere else is a legitimate flow.
+  const galleryLocked = hasUserSaved && undoStack.length <= 1;
+  saveMenu.innerHTML = [
+    `<button class="menu-item${galleryLocked ? " disabled" : ""}" data-save-action="gallery"${galleryLocked ? " disabled aria-disabled=\"true\"" : ""}>
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M4 5h16v14H4z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" />
+        <path d="M4 16l4-4 4 4 3-3 5 5" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" />
+        <circle cx="9" cy="9" r="1.5" stroke="currentColor" stroke-width="1.9" />
+      </svg>
+      <span>Save to gallery</span>
+    </button>`,
+    `<button class="menu-item" data-save-action="as">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M5 4h12l2 2v14H5V4z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" />
+        <path d="M16 3v6M13 6h6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" />
+      </svg>
+      <span>Save as…</span>
+    </button>`,
+  ].join("");
+}
+
+// ─── Save-to-gallery picker (the full tree + grid modal) ────────────────
+const pickerOverlay = document.querySelector<HTMLDivElement>("#save-picker")!;
+const pickerTreeEl = document.querySelector<HTMLElement>("#picker-tree")!;
+const pickerGridEl = document.querySelector<HTMLDivElement>("#picker-grid")!;
+const pickerCurrentName = document.querySelector<HTMLElement>("#picker-current-name")!;
+const pickerCloseBtn = document.querySelector<HTMLButtonElement>("#picker-close")!;
+const pickerCancelBtn = document.querySelector<HTMLButtonElement>("#picker-cancel")!;
+const pickerConfirmBtn = document.querySelector<HTMLButtonElement>("#picker-confirm")!;
+const pickerFilenameInput = document.querySelector<HTMLInputElement>("#picker-filename")!;
+
+let pickerTree: SaveFolderNode | null = null;
+let pickerSelectedPath: string = ""; // "" = gallery root
+let pickerExpandedFolders: Set<string> = new Set();
+let pickerSelectedItem: string | null = null;
+const pickerPreviewCache: Map<string, string> = new Map();
+const pickerMetadataCache: Map<string, GalleryMetadata> = new Map();
+
+interface PickerItem { path: string; name: string }
+interface GalleryMetadata {
+  name: string;
+  path: string;
+  width: number;
+  height: number;
+  sizeBytes: number;
+  modifiedMs: number;
+}
+
+const pickerInfoEl = document.querySelector<HTMLElement>("#picker-info")!;
+
+function findPickerFolder(node: SaveFolderNode | null, target: string): SaveFolderNode | null {
+  if (!node) return null;
+  const nodePath = node === pickerTree ? "" : node.path; // root → ""
+  if (nodePath === target) return node;
+  for (const child of node.children) {
+    const hit = findPickerFolder(child, target);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+// ─── Picker dialog (prompt / confirm) ────────────────────────────────────
+interface PickerDialogOptions {
+  title: string;
+  message?: string;
+  placeholder?: string;
+  defaultValue?: string;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  destructive?: boolean;
+  prompt?: boolean; // false → confirm
+}
+
+const pickerDialogEl = document.querySelector<HTMLDivElement>("#picker-dialog")!;
+const pickerDialogTitleEl = document.querySelector<HTMLElement>("#picker-dialog-title")!;
+const pickerDialogMessageEl = document.querySelector<HTMLElement>("#picker-dialog-message")!;
+const pickerDialogInputEl = document.querySelector<HTMLInputElement>("#picker-dialog-input")!;
+const pickerDialogCancelBtn = document.querySelector<HTMLButtonElement>("#picker-dialog-cancel")!;
+const pickerDialogConfirmBtn = document.querySelector<HTMLButtonElement>("#picker-dialog-confirm")!;
+
+let pickerDialogResolver: ((value: string | boolean | null) => void) | null = null;
+let pickerDialogIsPrompt = true;
+
+function pickerDialog(opts: PickerDialogOptions): Promise<string | boolean | null> {
+  return new Promise((resolve) => {
+    pickerDialogResolver = resolve;
+    pickerDialogIsPrompt = opts.prompt !== false;
+    pickerDialogTitleEl.textContent = opts.title;
+    pickerDialogMessageEl.textContent = opts.message ?? "";
+    pickerDialogMessageEl.style.display = opts.message ? "" : "none";
+    pickerDialogInputEl.style.display = pickerDialogIsPrompt ? "" : "none";
+    pickerDialogInputEl.value = opts.defaultValue ?? "";
+    pickerDialogInputEl.placeholder = opts.placeholder ?? "";
+    pickerDialogConfirmBtn.textContent = opts.confirmLabel ?? (pickerDialogIsPrompt ? "OK" : "Confirm");
+    pickerDialogCancelBtn.textContent = opts.cancelLabel ?? "Cancel";
+    pickerDialogConfirmBtn.classList.toggle("danger", !!opts.destructive);
+    pickerDialogEl.hidden = false;
+    if (pickerDialogIsPrompt) {
+      window.setTimeout(() => {
+        pickerDialogInputEl.focus();
+        pickerDialogInputEl.select();
+      }, 30);
+    } else {
+      window.setTimeout(() => pickerDialogConfirmBtn.focus(), 30);
+    }
+  });
+}
+
+function settlePickerDialog(value: string | boolean | null) {
+  pickerDialogEl.hidden = true;
+  const resolver = pickerDialogResolver;
+  pickerDialogResolver = null;
+  resolver?.(value);
+}
+
+pickerDialogCancelBtn.addEventListener("click", () => {
+  settlePickerDialog(pickerDialogIsPrompt ? null : false);
+});
+pickerDialogConfirmBtn.addEventListener("click", () => {
+  if (pickerDialogIsPrompt) {
+    const value = pickerDialogInputEl.value.trim();
+    if (!value) return; // require non-empty
+    settlePickerDialog(value);
+  } else {
+    settlePickerDialog(true);
+  }
+});
+pickerDialogInputEl.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    pickerDialogConfirmBtn.click();
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    pickerDialogCancelBtn.click();
+  }
+});
+
+// ─── Tree rendering with expand/collapse + hover actions ────────────────
+const CHEVRON_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" /></svg>`;
+const FOLDER_ICON = `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true" class="picker-tree-icon"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" /></svg>`;
+
+function renderPickerTree() {
+  if (!pickerTree) {
+    pickerTreeEl.innerHTML = `<div class="picker-empty">Gallery unavailable</div>`;
+    return;
+  }
+  const items: string[] = [];
+
+  const walk = (node: SaveFolderNode, depth: number, isRoot: boolean) => {
+    const path = isRoot ? "" : node.path;
+    const active = path === pickerSelectedPath;
+    const hasChildren = node.children.length > 0;
+    // Root uses its absolute path as the expansion key (matching the
+    // actual `data-folder-path` we serialize). Non-root nodes likewise.
+    // openSavePicker seeds the root key so it defaults to expanded.
+    const expandKey = isRoot ? node.path : node.path;
+    const expanded = hasChildren && pickerExpandedFolders.has(expandKey);
+
+    const chevron = hasChildren
+      ? `<button class="picker-tree-chevron${expanded ? " expanded" : ""}" data-tree-action="toggle" data-folder-path="${escapeHtml(isRoot ? "__root__" : path)}" title="${expanded ? "Collapse" : "Expand"}">${CHEVRON_SVG}</button>`
+      : `<span class="picker-tree-chevron-placeholder"></span>`;
+
+    const actions = `
+      <div class="picker-tree-actions">
+        <button data-tree-action="create" data-folder-path="${escapeHtml(path)}" title="New folder inside" aria-label="New folder">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
+            <path d="M12 11v6M9 14h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+          </svg>
+        </button>
+        ${isRoot ? "" : `
+          <button data-tree-action="rename" data-folder-path="${escapeHtml(path)}" title="Rename" aria-label="Rename">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M4 20l4.2-1 10.6-10.6a2.1 2.1 0 00-3-3L5.2 16 4 20z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" />
+            </svg>
+          </button>
+          <button class="danger" data-tree-action="delete" data-folder-path="${escapeHtml(path)}" title="Delete folder" aria-label="Delete folder">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M5 7h14M10 11v6M14 11v6M8 7l.7 12h6.6L16 7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
+        `}
+      </div>`;
+
+    items.push(
+      `<div class="picker-tree-row${active ? " active" : ""}" data-folder-path="${escapeHtml(path)}" data-tree-action="select" style="padding-left: ${4 + depth * 12}px;">
+        ${chevron}
+        ${FOLDER_ICON}
+        <span class="picker-tree-label">${escapeHtml(node.name)}</span>
+        ${actions}
+      </div>`,
+    );
+
+    if (expanded) {
+      for (const child of node.children) walk(child, depth + 1, false);
+    }
+  };
+
+  walk(pickerTree, 0, true);
+  pickerTreeEl.innerHTML = items.join("");
+}
+
+async function refreshPickerTree() {
+  try {
+    pickerTree = await invoke<SaveFolderNode>("list_gallery_tree");
+  } catch (error) {
+    console.error(error);
+    pickerTree = null;
+  }
+  renderPickerTree();
+}
+
+// ─── Folder operations (create / rename / delete) ───────────────────────
+async function handleTreeCreate(parentPath: string) {
+  const folder = findPickerFolder(pickerTree, parentPath);
+  const parentName = folder?.name ?? "Liem Shot";
+  const name = await pickerDialog({
+    title: "New folder",
+    message: `Inside "${parentName}"`,
+    placeholder: "Folder name",
+    confirmLabel: "Create",
+    prompt: true,
+  }) as string | null;
+  if (!name) return;
+  try {
+    await invoke("create_gallery_folder", {
+      parent: parentPath === "" ? null : parentPath,
+      name,
+    });
+    if (parentPath) pickerExpandedFolders.add(parentPath);
+    await refreshPickerTree();
+  } catch (error) {
+    await pickerDialog({ title: "Could not create folder", message: String(error), prompt: false });
+  }
+}
+
+async function handleTreeRename(path: string) {
+  const folder = findPickerFolder(pickerTree, path);
+  if (!folder) return;
+  const next = await pickerDialog({
+    title: "Rename folder",
+    defaultValue: folder.name,
+    placeholder: "New name",
+    confirmLabel: "Rename",
+    prompt: true,
+  }) as string | null;
+  if (!next || next === folder.name) return;
+  try {
+    const newPath = await invoke<string>("rename_gallery_folder", { path, newName: next });
+    if (pickerSelectedPath === path) pickerSelectedPath = newPath;
+    if (pickerExpandedFolders.has(path)) {
+      pickerExpandedFolders.delete(path);
+      pickerExpandedFolders.add(newPath);
+    }
+    await refreshPickerTree();
+    updatePickerCurrentLabel();
+    void renderPickerGrid();
+  } catch (error) {
+    await pickerDialog({ title: "Could not rename", message: String(error), prompt: false });
+  }
+}
+
+async function handleTreeDelete(path: string) {
+  const folder = findPickerFolder(pickerTree, path);
+  if (!folder) return;
+  const confirmed = await pickerDialog({
+    title: "Delete folder?",
+    message: `"${folder.name}" and everything inside will be removed. This cannot be undone.`,
+    confirmLabel: "Delete",
+    destructive: true,
+    prompt: false,
+  }) as boolean;
+  if (!confirmed) return;
+  try {
+    await invoke("delete_gallery_folder", { path });
+    if (pickerSelectedPath === path) pickerSelectedPath = "";
+    pickerExpandedFolders.delete(path);
+    await refreshPickerTree();
+    updatePickerCurrentLabel();
+    void renderPickerGrid();
+  } catch (error) {
+    await pickerDialog({ title: "Could not delete", message: String(error), prompt: false });
+  }
+}
+
+function togglePickerExpand(path: string) {
+  // "__root__" sentinel comes from the root row's chevron. Translate
+  // it to the gallery root's absolute path so both sides agree on the
+  // expansion key.
+  const key = path === "__root__" ? (pickerTree?.path ?? "") : path;
+  if (pickerExpandedFolders.has(key)) pickerExpandedFolders.delete(key);
+  else pickerExpandedFolders.add(key);
+  renderPickerTree();
+}
+
+// Single delegated handler covers every tree-row interaction. The
+// `data-tree-action` attribute on the inner button (or the row itself
+// for plain selection) decides which path to take.
+pickerTreeEl.addEventListener("click", (event) => {
+  const actionEl = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-tree-action]");
+  if (!actionEl) return;
+  const action = actionEl.dataset.treeAction;
+  const path = actionEl.dataset.folderPath ?? "";
+
+  if (action === "toggle") {
+    event.stopPropagation();
+    togglePickerExpand(path);
+    return;
+  }
+  if (action === "create") { event.stopPropagation(); void handleTreeCreate(path); return; }
+  if (action === "rename") { event.stopPropagation(); void handleTreeRename(path); return; }
+  if (action === "delete") { event.stopPropagation(); void handleTreeDelete(path); return; }
+
+  // Default = row click = select folder.
+  if (path !== pickerSelectedPath) {
+    pickerSelectedPath = path;
+    renderPickerTree();
+    updatePickerCurrentLabel();
+    void renderPickerGrid();
+  }
+});
+
+async function renderPickerGrid() {
+  pickerGridEl.innerHTML = `<div class="picker-empty">Loading…</div>`;
+  let items: PickerItem[] = [];
+  try {
+    items = await invoke<PickerItem[]>("list_gallery_items", {
+      folder: pickerSelectedPath === "" ? null : pickerSelectedPath,
+    });
+  } catch (error) {
+    console.error(error);
+    pickerGridEl.innerHTML = `<div class="picker-empty">Could not list folder</div>`;
+    if (pickerSelectedItem) {
+      pickerSelectedItem = null;
+      renderPickerInfo();
+    }
+    return;
+  }
+  // Clear stale selection if the previously-selected file is no longer
+  // in the visible folder.
+  if (pickerSelectedItem && !items.some((it) => it.path === pickerSelectedItem)) {
+    pickerSelectedItem = null;
+    renderPickerInfo();
+  }
+  if (items.length === 0) {
+    pickerGridEl.innerHTML = `<div class="picker-empty">Folder is empty</div>`;
+    return;
+  }
+
+  // Render placeholders synchronously; backfill each tile with its
+  // preview as the Rust calls land.
+  pickerGridEl.innerHTML = items
+    .map((it) => {
+      const selected = pickerSelectedItem === it.path ? " selected" : "";
+      return `<div class="picker-tile${selected}" data-preview-path="${escapeHtml(it.path)}" title="${escapeHtml(it.name)}"></div>`;
+    })
+    .join("");
+
+  for (const it of items) {
+    const tile = pickerGridEl.querySelector<HTMLElement>(
+      `[data-preview-path="${CSS.escape(it.path)}"]`,
+    );
+    if (!tile) continue;
+    if (pickerPreviewCache.has(it.path)) {
+      tile.innerHTML = `<img src="data:image/png;base64,${pickerPreviewCache.get(it.path)}" draggable="false" />`;
+      continue;
+    }
+    invoke<string>("get_gallery_preview", { path: it.path })
+      .then((b64) => {
+        pickerPreviewCache.set(it.path, b64);
+        if (tile.isConnected) {
+          tile.innerHTML = `<img src="data:image/png;base64,${b64}" draggable="false" />`;
+        }
+      })
+      .catch(console.error);
+  }
+}
+
+function fileBaseNameNoExt(p: string): string {
+  const base = fileBaseName(p);
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(0, dot) : base;
+}
+
+function renderPickerInfo() {
+  if (!pickerSelectedItem) {
+    pickerInfoEl.hidden = true;
+    pickerInfoEl.innerHTML = "";
+    return;
+  }
+  const path = pickerSelectedItem;
+  const meta = pickerMetadataCache.get(path);
+  const preview = pickerPreviewCache.get(path);
+  const name = meta?.name ?? fileBaseName(path);
+
+  pickerInfoEl.hidden = false;
+  pickerInfoEl.innerHTML = `
+    <div class="picker-info-header">
+      <span class="picker-info-header-title">Info</span>
+      <button class="picker-info-icon-btn" data-info-action="close" title="Close">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+        </svg>
+      </button>
+    </div>
+    <div class="picker-info-preview">
+      ${preview ? `<img src="data:image/png;base64,${preview}" draggable="false" />` : ""}
+    </div>
+    <div class="picker-info-row picker-info-name-row">
+      <div style="flex: 1; min-width: 0;">
+        <span class="picker-info-label">Name</span>
+        <div class="picker-info-value">${escapeHtml(name)}</div>
+      </div>
+      <button class="picker-info-icon-btn" data-info-action="rename" title="Rename">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M4 20l4.2-1 10.6-10.6a2.1 2.1 0 00-3-3L5.2 16 4 20z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" />
+        </svg>
+      </button>
+      <button class="picker-info-icon-btn danger" data-info-action="delete" title="Delete">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M5 7h14M10 11v6M14 11v6M8 7l.7 12h6.6L16 7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </button>
+    </div>
+    ${meta ? `
+      <div class="picker-info-row">
+        <span class="picker-info-label">Resolution</span>
+        <div class="picker-info-value">${meta.width} × ${meta.height} px</div>
+      </div>
+      <div class="picker-info-row">
+        <span class="picker-info-label">Size</span>
+        <div class="picker-info-value">${formatPickerBytes(meta.sizeBytes)}</div>
+      </div>
+      <div class="picker-info-row">
+        <span class="picker-info-label">Taken</span>
+        <div class="picker-info-value">${formatPickerDate(meta.modifiedMs)}</div>
+      </div>
+    ` : `<div class="picker-info-row"><div class="picker-info-value" style="color: rgba(255,255,255,0.55);">Loading info…</div></div>`}
+  `;
+
+  if (!meta) {
+    invoke<GalleryMetadata>("get_gallery_metadata", { path })
+      .then((m) => {
+        pickerMetadataCache.set(path, m);
+        if (pickerSelectedItem === path) renderPickerInfo();
+      })
+      .catch(console.error);
+  }
+}
+
+function formatPickerBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+function formatPickerDate(ms: number): string {
+  try {
+    return new Date(ms).toLocaleString(undefined, {
+      year: "numeric", month: "short", day: "2-digit",
+      hour: "2-digit", minute: "2-digit",
+    });
+  } catch {
+    return new Date(ms).toString();
+  }
+}
+
+async function renamePickerItem(path: string) {
+  const stem = fileBaseNameNoExt(path);
+  const next = await pickerDialog({
+    title: "Rename screenshot",
+    defaultValue: stem,
+    placeholder: "New name",
+    confirmLabel: "Rename",
+    prompt: true,
+  }) as string | null;
+  if (!next || next === stem) return;
+  try {
+    const newPath = await invoke<string>("rename_gallery_item", { path, newName: next });
+    // Migrate caches over to the new path so we don't refetch the
+    // preview and metadata we already have.
+    const preview = pickerPreviewCache.get(path);
+    if (preview !== undefined) {
+      pickerPreviewCache.set(newPath, preview);
+      pickerPreviewCache.delete(path);
+    }
+    pickerMetadataCache.delete(path);
+    if (pickerSelectedItem === path) pickerSelectedItem = newPath;
+    await renderPickerGrid();
+    renderPickerInfo();
+  } catch (error) {
+    await pickerDialog({ title: "Could not rename", message: String(error), prompt: false });
+  }
+}
+
+async function deletePickerItem(path: string) {
+  const baseName = fileBaseName(path);
+  const confirmed = await pickerDialog({
+    title: "Delete screenshot?",
+    message: `"${baseName}" will be removed. This cannot be undone.`,
+    confirmLabel: "Delete",
+    destructive: true,
+    prompt: false,
+  }) as boolean;
+  if (!confirmed) return;
+  try {
+    await invoke("delete_gallery_item", { path });
+    pickerPreviewCache.delete(path);
+    pickerMetadataCache.delete(path);
+    if (pickerSelectedItem === path) pickerSelectedItem = null;
+    await renderPickerGrid();
+    renderPickerInfo();
+  } catch (error) {
+    await pickerDialog({ title: "Could not delete", message: String(error), prompt: false });
+  }
+}
+
+// Click on a tile in the grid → select for info viewing.
+pickerGridEl.addEventListener("click", (event) => {
+  const tile = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-preview-path]");
+  if (!tile) return;
+  const path = tile.dataset.previewPath ?? "";
+  pickerSelectedItem = pickerSelectedItem === path ? null : path;
+  // Update selected class without full re-render (cheaper).
+  pickerGridEl.querySelectorAll<HTMLElement>(".picker-tile.selected").forEach((el) => {
+    el.classList.remove("selected");
+  });
+  if (pickerSelectedItem) {
+    pickerGridEl
+      .querySelector<HTMLElement>(`[data-preview-path="${CSS.escape(pickerSelectedItem)}"]`)
+      ?.classList.add("selected");
+  }
+  renderPickerInfo();
+});
+
+// Info panel action delegation (close / rename / delete).
+pickerInfoEl.addEventListener("click", (event) => {
+  const target = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-info-action]");
+  if (!target || !pickerSelectedItem) return;
+  const action = target.dataset.infoAction;
+  if (action === "close") {
+    pickerSelectedItem = null;
+    pickerGridEl.querySelectorAll<HTMLElement>(".picker-tile.selected").forEach((el) => el.classList.remove("selected"));
+    renderPickerInfo();
+  } else if (action === "rename") {
+    void renamePickerItem(pickerSelectedItem);
+  } else if (action === "delete") {
+    void deletePickerItem(pickerSelectedItem);
+  }
+});
+
+// F2 → rename selected file (or current folder if no file selected).
+// Delete → delete selected file (or current folder if root has no item).
+window.addEventListener("keydown", (event) => {
+  if (pickerOverlay.hidden) return;
+  // Don't hijack typing inside the filename input / dialog input.
+  const t = event.target as HTMLElement | null;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+  // Don't fire while a dialog is open (its own listeners handle keys).
+  if (!pickerDialogEl.hidden) return;
+
+  if (event.key === "F2") {
+    event.preventDefault();
+    event.stopPropagation();
+    if (pickerSelectedItem) void renamePickerItem(pickerSelectedItem);
+    else if (pickerSelectedPath) void handleTreeRename(pickerSelectedPath);
+    return;
+  }
+  if (event.key === "Delete") {
+    event.preventDefault();
+    event.stopPropagation();
+    if (pickerSelectedItem) void deletePickerItem(pickerSelectedItem);
+    else if (pickerSelectedPath) void handleTreeDelete(pickerSelectedPath);
+  }
+}, true);
+
+function updatePickerCurrentLabel() {
+  const folder = findPickerFolder(pickerTree, pickerSelectedPath);
+  pickerCurrentName.textContent = folder?.name ?? "…";
+}
+
+function autoExpandAncestors(rootPath: string, targetPath: string) {
+  if (!targetPath || targetPath === rootPath) return;
+  // The path "D:/Liem Shot/Foo/Bar" needs every ancestor segment
+  // expanded so the selected node is actually visible. Walk parents
+  // until we hit the gallery root (or filesystem root as a fallback).
+  let current = targetPath;
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+  while (current && current !== rootPath) {
+    pickerExpandedFolders.add(current);
+    const slash = Math.max(current.lastIndexOf("\\"), current.lastIndexOf("/"));
+    if (slash <= 0) break;
+    const parent = current.slice(0, slash);
+    if (parent === current) break;
+    current = parent;
+  }
+}
+
+async function openSavePicker() {
+  if (!filePath || !isPreviewMode || !isEditorReady) return;
+  try {
+    pickerTree = await invoke<SaveFolderNode>("list_gallery_tree");
+  } catch (error) {
+    console.error(error);
+    pickerTree = null;
+  }
+  // Default selection: last-used folder, or current file's folder if
+  // we've never saved before, falling back to root.
+  const remembered = localStorage.getItem(LAST_GALLERY_FOLDER_KEY);
+  if (remembered !== null && findPickerFolder(pickerTree, remembered)) {
+    pickerSelectedPath = remembered;
+  } else {
+    const galleryRootGuess = pickerTree?.path ?? "";
+    const cur = fileFolder(filePath);
+    pickerSelectedPath = cur && cur !== galleryRootGuess && findPickerFolder(pickerTree, cur) ? cur : "";
+  }
+  // Root defaults to expanded the first time the user opens the picker.
+  // After that we respect whatever expansion state they left it in.
+  if (pickerTree) {
+    if (!pickerExpandedFolders.has(pickerTree.path)
+        && !pickerExpandedFolders.has("__root_seen__")) {
+      pickerExpandedFolders.add(pickerTree.path);
+      pickerExpandedFolders.add("__root_seen__");
+    }
+  }
+  // Make sure the selected folder is visible in the tree.
+  if (pickerTree && pickerSelectedPath) {
+    autoExpandAncestors(pickerTree.path, pickerSelectedPath);
+  }
+  pickerSelectedItem = null;
+  // Pre-fill the filename input with the current file's name (without
+  // the .png extension — that's added as a static suffix in the UI).
+  const baseName = fileBaseName(filePath);
+  const dotIdx = baseName.lastIndexOf(".");
+  pickerFilenameInput.value = dotIdx > 0 ? baseName.slice(0, dotIdx) : baseName;
+
+  renderPickerTree();
+  renderPickerInfo();
+  updatePickerCurrentLabel();
+  void renderPickerGrid();
+  pickerOverlay.hidden = false;
+  // Focus + select the name input so users can immediately type a new
+  // name or hit Enter to accept the default.
+  window.setTimeout(() => {
+    pickerFilenameInput.focus();
+    pickerFilenameInput.select();
+  }, 50);
+}
+
+function closeSavePicker() {
+  pickerOverlay.hidden = true;
+  pickerSelectedItem = null;
+  renderPickerInfo();
+  if (!pickerDialogEl.hidden) settlePickerDialog(null);
+}
+
+pickerCloseBtn.addEventListener("click", closeSavePicker);
+pickerCancelBtn.addEventListener("click", closeSavePicker);
+
+function confirmSaveFromPicker() {
+  const dest = pickerSelectedPath;
+  const name = pickerFilenameInput.value.trim();
+  closeSavePicker();
+  void saveToFolder(dest, name.length > 0 ? name : null);
+}
+
+pickerConfirmBtn.addEventListener("click", confirmSaveFromPicker);
+
+// Enter in the filename input → submit. Esc in the input → close picker
+// (the global Esc handler below also handles this but capturing here
+// stops the input's own keydown from doing anything weird first).
+pickerFilenameInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    confirmSaveFromPicker();
+  }
+});
+
+// Esc closes the picker (when it's open) without disturbing the editor.
+// If a dialog is layered on top of the picker, Esc unwinds that first
+// so users can back out one step at a time.
+window.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || pickerOverlay.hidden) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (!pickerDialogEl.hidden) {
+    settlePickerDialog(pickerDialogIsPrompt ? null : false);
+  } else {
+    closeSavePicker();
+  }
+}, true);
+
+async function saveToFolder(folderPath: string, destName: string | null = null) {
+  if (!filePath || !isPreviewMode || !isEditorReady) return;
   saveButton.disabled = true;
   saveButton.classList.add("active");
   try {
     const dataUrl = editCanvas.toDataURL("image/png");
+    const hasEdits = undoStack.length > 1;
     const data = await invoke<ThumbnailData>("save_edited_thumbnail", {
       label: currentWindow.label,
       path: filePath,
       dataUrl,
+      destFolder: folderPath === "" ? null : folderPath,
+      destName,
+      hasEdits,
     });
+    // Rust may have moved the file to a new folder — re-anchor filePath
+    // and the loadedFilePath cache so subsequent edits target the right
+    // location.
+    filePath = data.path;
+    loadedFilePath = data.path;
     imageDataUrl = `data:image/png;base64,${data.image}`;
     image.src = imageDataUrl;
     undoStack = [dataUrl];
     redoStack = [];
     updateHistoryButtons();
     flashStatus("Saved");
+    hasUserSaved = true;
+    localStorage.setItem(LAST_GALLERY_FOLDER_KEY, folderPath);
+  } catch (error) {
+    // Rust returns descriptive strings for the "nothing to save" and
+    // "duplicate exists" guards; surface them in the status pill so the
+    // user knows why the click didn't take.
+    const message = typeof error === "string" ? error : "Save failed";
+    console.error(error);
+    flashStatus(message);
+  } finally {
+    saveButton.disabled = false;
+    saveButton.classList.remove("active");
+  }
+}
+
+async function saveAs() {
+  if (!filePath || !isPreviewMode || !isEditorReady) return;
+  // Lazy-load the dialog plugin so the cold start of the thumbnail
+  // window isn't paying for code that most users never invoke.
+  const { save } = await import("@tauri-apps/plugin-dialog");
+
+  const baseName = fileBaseName(filePath);
+  const lastDir = localStorage.getItem(LAST_SAVE_AS_DIR_KEY);
+  const defaultPath = lastDir ? `${lastDir}\\${baseName}` : baseName;
+
+  let chosen: string | null = null;
+  try {
+    chosen = await save({
+      defaultPath,
+      filters: [{ name: "PNG Image", extensions: ["png"] }],
+    });
+  } catch (error) {
+    console.error(error);
+    flashStatus("Save failed");
+    return;
+  }
+  if (!chosen) return; // user cancelled
+
+  saveButton.disabled = true;
+  saveButton.classList.add("active");
+  try {
+    const dataUrl = editCanvas.toDataURL("image/png");
+    await invoke("export_png_to_path", { path: chosen, dataUrl });
+    flashStatus("Saved");
+    const dir = fileFolder(chosen);
+    if (dir) localStorage.setItem(LAST_SAVE_AS_DIR_KEY, dir);
   } catch (error) {
     console.error(error);
     flashStatus("Save failed");
@@ -1890,6 +2717,34 @@ saveButton.addEventListener("click", async () => {
     saveButton.disabled = false;
     saveButton.classList.remove("active");
   }
+}
+
+saveButton.addEventListener("click", (event) => {
+  event.stopPropagation();
+  if (saveButton.disabled) return;
+  if (saveGroup.classList.contains("open")) {
+    saveGroup.classList.remove("open");
+    return;
+  }
+  renderSaveRootMenu();
+  saveGroup.classList.add("open");
+});
+
+saveGroup.addEventListener("click", (event) => {
+  const target = (event.target as HTMLElement | null)
+    ?.closest<HTMLElement>("[data-save-action]");
+  if (!target) return;
+  event.stopPropagation();
+  // Locked entries (e.g. "Save to gallery" when there's nothing new) get
+  // a disabled attribute and a "No changes" hint. Swallow the click so
+  // nothing happens — leaving the menu open lets the user pick another
+  // option without having to reopen it.
+  if (target.hasAttribute("disabled")) return;
+  saveGroup.classList.remove("open");
+
+  const action = target.dataset.saveAction;
+  if (action === "gallery") void openSavePicker();
+  else if (action === "as") void saveAs();
 });
 
 listen("liem-thumbnail-pause", () => {
@@ -2009,6 +2864,7 @@ document.addEventListener("pointerdown", (event) => {
   if (!shapeGroup.contains(target)) shapeGroup.classList.remove("open");
   if (!cropGroup.contains(target)) cropGroup.classList.remove("open");
   if (!transformGroup.contains(target)) transformGroup.classList.remove("open");
+  if (!saveGroup.contains(target)) saveGroup.classList.remove("open");
 });
 
 window.__LIEM_SET_THUMBNAIL = applyThumbnail;

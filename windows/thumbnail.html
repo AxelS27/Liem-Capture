@@ -539,6 +539,490 @@
         color: rgba(255, 255, 255, 0.96);
       }
 
+      .menu-item.disabled,
+      .menu-item[disabled] {
+        opacity: 0.45;
+        cursor: not-allowed;
+        background: transparent !important;
+        color: rgba(255, 255, 255, 0.55) !important;
+      }
+      .menu-item.disabled:hover,
+      .menu-item[disabled]:hover {
+        background: transparent !important;
+        color: rgba(255, 255, 255, 0.55) !important;
+      }
+
+      .menu-label {
+        padding: 6px 8px 4px;
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: rgba(255, 255, 255, 0.42);
+      }
+
+      .menu-divider {
+        height: 1px;
+        margin: 4px 4px;
+        background: rgba(255, 255, 255, 0.12);
+      }
+
+      .menu-item .item-tag {
+        margin-left: auto;
+        font-size: 10px;
+        font-weight: 600;
+        color: rgba(255, 255, 255, 0.55);
+      }
+
+      /* ─── Save-to-gallery picker ─────────────────────────────────── */
+      #save-picker {
+        position: absolute;
+        inset: 0;
+        z-index: 20;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.55);
+        animation: picker-fade-in 140ms ease-out;
+      }
+      #save-picker[hidden] {
+        display: none;
+      }
+      @keyframes picker-fade-in {
+        from { opacity: 0; }
+        to   { opacity: 1; }
+      }
+
+      .picker-card {
+        width: min(720px, calc(100% - 32px));
+        height: min(520px, calc(100% - 32px));
+        display: flex;
+        flex-direction: column;
+        border-radius: 16px;
+        overflow: hidden;
+        background: rgba(22, 22, 26, 0.94);
+        border: 1.5px solid rgba(255, 255, 255, 0.22);
+        box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+        backdrop-filter: blur(20px) saturate(1.3);
+        -webkit-backdrop-filter: blur(20px) saturate(1.3);
+        animation: picker-card-in 180ms cubic-bezier(0.22, 1, 0.36, 1);
+      }
+      @keyframes picker-card-in {
+        from { opacity: 0; transform: translateY(8px) scale(0.96); }
+        to   { opacity: 1; transform: translateY(0)   scale(1);    }
+      }
+
+      .picker-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 12px 16px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+      }
+      .picker-title {
+        color: rgba(255, 255, 255, 0.95);
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+      }
+      .picker-close {
+        width: 26px;
+        height: 26px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border: 0;
+        border-radius: 8px;
+        background: transparent;
+        color: rgba(255, 255, 255, 0.7);
+        cursor: pointer;
+      }
+      .picker-close:hover {
+        background: rgba(255, 255, 255, 0.12);
+        color: rgba(255, 255, 255, 0.95);
+      }
+
+      .picker-body {
+        flex: 1;
+        display: flex;
+        min-height: 0;
+      }
+
+      .picker-tree {
+        width: 210px;
+        flex-shrink: 0;
+        border-right: 1px solid rgba(255, 255, 255, 0.12);
+        padding: 8px 4px;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+      }
+
+      .picker-tree-row {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 5px 6px;
+        border-radius: 8px;
+        cursor: pointer;
+      }
+      .picker-tree-row:hover {
+        background: rgba(255, 255, 255, 0.08);
+      }
+      .picker-tree-row.active {
+        background: rgba(255, 255, 255, 0.18);
+      }
+      .picker-tree-row.drop-target {
+        background: rgba(20, 200, 120, 0.18);
+        outline: 1.5px solid rgba(70, 230, 150, 0.7);
+      }
+
+      .picker-tree-chevron,
+      .picker-tree-chevron-placeholder {
+        width: 22px;
+        height: 22px;
+        flex-shrink: 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border: 0;
+        background: transparent;
+        color: rgba(255, 255, 255, 0.78);
+        cursor: pointer;
+        border-radius: 6px;
+      }
+      .picker-tree-chevron:hover {
+        background: rgba(255, 255, 255, 0.18);
+        color: rgba(255, 255, 255, 0.98);
+      }
+      .picker-tree-chevron svg {
+        transition: transform 140ms ease;
+      }
+      .picker-tree-chevron.expanded svg {
+        transform: rotate(90deg);
+      }
+
+      .picker-tree-icon {
+        width: 14px;
+        height: 14px;
+        flex-shrink: 0;
+        color: rgba(255, 255, 255, 0.8);
+      }
+
+      .picker-tree-label {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: rgba(255, 255, 255, 0.78);
+        font-size: 12px;
+      }
+      .picker-tree-row.active .picker-tree-label {
+        color: rgba(255, 255, 255, 1);
+      }
+
+      .picker-tree-actions {
+        display: none;
+        align-items: center;
+        gap: 2px;
+        margin-left: auto;
+      }
+      .picker-tree-row:hover .picker-tree-actions {
+        display: inline-flex;
+      }
+      .picker-tree-actions button {
+        width: 22px;
+        height: 22px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        background: transparent;
+        border: 0;
+        border-radius: 6px;
+        color: rgba(255, 255, 255, 0.8);
+        cursor: pointer;
+      }
+      .picker-tree-actions button:hover {
+        background: rgba(255, 255, 255, 0.18);
+        color: rgba(255, 255, 255, 1);
+      }
+      .picker-tree-actions button.danger:hover {
+        background: rgba(214, 51, 72, 0.55);
+      }
+
+      .picker-tree-row .item-tag {
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: rgba(255, 200, 130, 0.85);
+        margin-left: 4px;
+      }
+      .picker-tree-row:hover .item-tag {
+        display: none;
+      }
+
+      .picker-main {
+        flex: 1;
+        min-width: 0;
+        padding: 12px 12px 14px;
+        overflow-y: auto;
+      }
+      .picker-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 8px;
+      }
+      .picker-tile {
+        aspect-ratio: 3 / 2;
+        overflow: hidden;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        background: rgba(0, 0, 0, 0.4);
+        cursor: pointer;
+        transition: border-color 120ms ease, transform 120ms ease;
+      }
+      .picker-tile:hover {
+        border-color: rgba(255, 255, 255, 0.4);
+      }
+      .picker-tile.selected {
+        border-color: rgba(255, 255, 255, 0.85);
+        outline: 2px solid rgba(255, 255, 255, 0.35);
+        outline-offset: -1px;
+      }
+      .picker-tile img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+        pointer-events: none;
+      }
+
+      /* ─── Info panel for selected file ───────────────────────────── */
+      .picker-info {
+        width: 200px;
+        flex-shrink: 0;
+        border-left: 1px solid rgba(255, 255, 255, 0.12);
+        padding: 10px 12px;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .picker-info-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .picker-info-header-title {
+        color: rgba(255, 255, 255, 0.85);
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .picker-info-preview {
+        aspect-ratio: 3 / 2;
+        border-radius: 8px;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        background: rgba(0, 0, 0, 0.4);
+      }
+      .picker-info-preview img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+      .picker-info-row .picker-info-label {
+        display: block;
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: rgba(255, 255, 255, 0.42);
+        margin-bottom: 2px;
+      }
+      .picker-info-row .picker-info-value {
+        color: rgba(255, 255, 255, 0.92);
+        font-size: 11px;
+        word-break: break-all;
+      }
+      .picker-info-name-row {
+        display: flex;
+        align-items: flex-start;
+        gap: 4px;
+      }
+      .picker-info-name-row .picker-info-value {
+        flex: 1;
+        min-width: 0;
+      }
+      .picker-info-icon-btn {
+        width: 22px;
+        height: 22px;
+        flex-shrink: 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        background: transparent;
+        border: 0;
+        border-radius: 6px;
+        color: rgba(255, 255, 255, 0.7);
+        cursor: pointer;
+      }
+      .picker-info-icon-btn:hover {
+        background: rgba(255, 255, 255, 0.15);
+        color: rgba(255, 255, 255, 1);
+      }
+      .picker-info-icon-btn.danger:hover {
+        background: rgba(214, 51, 72, 0.55);
+      }
+      .picker-empty {
+        color: rgba(255, 255, 255, 0.5);
+        font-size: 11px;
+        text-align: center;
+        padding: 24px 0;
+      }
+
+      .picker-footer {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 10px 16px;
+        border-top: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(0, 0, 0, 0.22);
+      }
+      .picker-footer-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .picker-name-label {
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.55);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        font-weight: 600;
+      }
+      .picker-filename {
+        flex: 1;
+        min-width: 0;
+        background: rgba(0, 0, 0, 0.45);
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 8px;
+        padding: 7px 10px;
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.95);
+        outline: none;
+      }
+      .picker-filename:focus {
+        border-color: rgba(255, 255, 255, 0.5);
+        background: rgba(0, 0, 0, 0.55);
+      }
+      .picker-ext {
+        color: rgba(255, 255, 255, 0.6);
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .picker-current {
+        color: rgba(255, 255, 255, 0.65);
+        font-size: 11px;
+      }
+      .picker-current strong {
+        color: rgba(255, 255, 255, 0.95);
+        font-weight: 600;
+      }
+      .picker-actions {
+        display: flex;
+        gap: 8px;
+      }
+      .picker-btn {
+        padding: 6px 14px;
+        border-radius: 8px;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        border: 1px solid transparent;
+      }
+      .picker-btn-ghost {
+        background: transparent;
+        border-color: rgba(255, 255, 255, 0.18);
+        color: rgba(255, 255, 255, 0.85);
+      }
+      .picker-btn-ghost:hover {
+        background: rgba(255, 255, 255, 0.1);
+      }
+      .picker-btn-primary {
+        background: rgba(255, 255, 255, 0.22);
+        border-color: rgba(255, 255, 255, 0.3);
+        color: rgba(255, 255, 255, 0.98);
+      }
+      .picker-btn-primary:hover {
+        background: rgba(255, 255, 255, 0.32);
+      }
+      .picker-btn-primary.danger {
+        background: rgba(214, 51, 72, 0.85);
+        border-color: rgba(255, 120, 140, 0.5);
+      }
+      .picker-btn-primary.danger:hover {
+        background: rgba(238, 69, 89, 0.95);
+      }
+
+      /* ─── Picker-internal dialog (prompt / confirm) ───────────────── */
+      #picker-dialog {
+        position: absolute;
+        inset: 0;
+        z-index: 10;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.55);
+        animation: picker-fade-in 120ms ease-out;
+      }
+      #picker-dialog[hidden] {
+        display: none;
+      }
+      .picker-dialog-card {
+        width: min(360px, calc(100% - 32px));
+        padding: 16px 18px 14px;
+        border-radius: 12px;
+        background: rgba(22, 22, 26, 0.95);
+        border: 1.5px solid rgba(255, 255, 255, 0.22);
+        box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+      }
+      .picker-dialog-title {
+        margin: 0 0 6px;
+        font-size: 13px;
+        font-weight: 600;
+        color: rgba(255, 255, 255, 0.96);
+      }
+      .picker-dialog-message {
+        margin: 0 0 10px;
+        font-size: 11.5px;
+        line-height: 1.5;
+        color: rgba(255, 255, 255, 0.72);
+      }
+      .picker-dialog-input {
+        width: 100%;
+        margin-bottom: 12px;
+        background: rgba(0, 0, 0, 0.4);
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 8px;
+        padding: 7px 10px;
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.95);
+        outline: none;
+      }
+      .picker-dialog-input:focus {
+        border-color: rgba(255, 255, 255, 0.5);
+        background: rgba(0, 0, 0, 0.55);
+      }
+      .picker-dialog-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+      }
+
       #shell.preview-mode #toolbar {
         opacity: 0;
         top: 8px;
@@ -831,13 +1315,84 @@
             <path d="M8 7l.6 12h6.8L16 7M10 7l.7-2h2.6L14 7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
           </svg>
         </button>
-        <button id="tool-save" class="tool-button" title="Save" aria-label="Save">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path d="M5 4h12l2 2v14H5V4z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" />
-            <path d="M8 4v6h8V4M8 20v-6h8v6" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" />
-          </svg>
-        </button>
+        <div id="save-group" class="tool-group">
+          <button id="tool-save" class="tool-button" title="Save" aria-label="Save">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M5 4h12l2 2v14H5V4z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" />
+              <path d="M8 4v6h8V4M8 20v-6h8v6" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" />
+            </svg>
+          </button>
+          <div id="save-menu" class="tool-menu" style="left: auto; right: -6px; transform: none; min-width: 200px; max-height: 320px; overflow-y: auto;">
+            <!-- Populated dynamically by thumbnail.ts whenever the save
+                 button is clicked (so the folder list is always fresh). -->
+          </div>
+        </div>
       </nav>
+
+      <!-- Save-to-gallery picker. Hidden by default. Mounted inside the
+           thumbnail window so it overlays the editor when shown. -->
+      <div id="save-picker" hidden>
+        <div class="picker-card">
+          <header class="picker-header">
+            <span class="picker-title">Save to gallery</span>
+            <button id="picker-close" class="picker-close" aria-label="Close">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+              </svg>
+            </button>
+          </header>
+          <div class="picker-body">
+            <aside id="picker-tree" class="picker-tree"></aside>
+            <section class="picker-main">
+              <div id="picker-grid" class="picker-grid"></div>
+            </section>
+            <aside id="picker-info" class="picker-info" hidden>
+              <!-- Populated by JS when a tile is selected. -->
+            </aside>
+          </div>
+          <footer class="picker-footer">
+            <div class="picker-footer-row">
+              <span class="picker-current">Into: <strong id="picker-current-name">…</strong></span>
+            </div>
+            <div class="picker-footer-row">
+              <span class="picker-name-label">Name</span>
+              <input
+                id="picker-filename"
+                class="picker-filename"
+                type="text"
+                placeholder="filename"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <span class="picker-ext">.png</span>
+              <div class="picker-actions">
+                <button id="picker-cancel" class="picker-btn picker-btn-ghost">Cancel</button>
+                <button id="picker-confirm" class="picker-btn picker-btn-primary">Save</button>
+              </div>
+            </div>
+          </footer>
+
+          <!-- Reusable prompt / confirm dialog rendered ABOVE the picker.
+               Driven by `pickerDialog()` in thumbnail.ts. -->
+          <div id="picker-dialog" hidden>
+            <div class="picker-dialog-card">
+              <h3 id="picker-dialog-title" class="picker-dialog-title"></h3>
+              <p id="picker-dialog-message" class="picker-dialog-message"></p>
+              <input
+                id="picker-dialog-input"
+                class="picker-dialog-input"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <div class="picker-dialog-actions">
+                <button id="picker-dialog-cancel" class="picker-btn picker-btn-ghost">Cancel</button>
+                <button id="picker-dialog-confirm" class="picker-btn picker-btn-primary">OK</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
     </main>
 
     <script type="module" src="/src/thumbnail.ts"></script>

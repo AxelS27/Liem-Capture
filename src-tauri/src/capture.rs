@@ -526,11 +526,33 @@ pub fn get_image_data(path: String) -> Result<String, String> {
     Ok(STANDARD.encode(bytes))
 }
 
+/// Decode a base64 data URL and write the resulting PNG bytes to the
+/// user-chosen destination. Used by the "Save as…" flow when the user
+/// wants to export an edited screenshot outside the gallery (Desktop,
+/// Downloads, anywhere on disk).
+#[command]
+pub fn export_png_to_path(path: String, data_url: String) -> Result<(), String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let encoded = data_url
+        .split_once(',')
+        .map(|(_, data)| data)
+        .unwrap_or(data_url.as_str());
+    let bytes = STANDARD.decode(encoded).map_err(|e| e.to_string())?;
+    let img = image::load_from_memory(&bytes)
+        .map_err(|e| e.to_string())?
+        .to_rgba8();
+    save_png_fast(Path::new(&path), &img)
+}
+
 #[command]
 pub fn save_edited_thumbnail(
+    app: AppHandle,
     label: String,
     path: String,
     data_url: String,
+    dest_folder: Option<String>,
+    dest_name: Option<String>,
+    has_edits: bool,
 ) -> Result<ThumbnailPayload, String> {
     use base64::{engine::general_purpose::STANDARD, Engine};
 
@@ -543,10 +565,121 @@ pub fn save_edited_thumbnail(
         .map_err(|e| e.to_string())?
         .to_rgba8();
 
-    save_png_fast(Path::new(&path), &img)?;
+    let src = PathBuf::from(&path);
+    // Resolve the final write location.
+    //
+    //   • dest_folder = None / ""        → overwrite the original file in place
+    //   • dest_folder names a sub-folder → write into that folder, using the
+    //                                      source's filename
+    //
+    // Then apply the save guard:
+    //
+    //   final == src           saving in place
+    //                          • no edits   → block. Nothing has actually
+    //                                         changed; spamming save would
+    //                                         just keep re-encoding the same
+    //                                         bytes.
+    //                          • has edits  → overwrite. Standard "bake my
+    //                                         edits into the original" flow.
+    //
+    //   final != src           saving to a different folder
+    //                          • destination clean              → save.
+    //                          • destination has duplicate name
+    //                              · no edits  → block (nothing to copy and
+    //                                            we won't silently clobber
+    //                                            an unrelated screenshot).
+    //                              · has edits → auto-suffix and save as a
+    //                                            new file (foo.png →
+    //                                            foo_1.png). The edits make
+    //                                            it a genuinely new artifact.
+    // Resolve target folder: explicit dest_folder, else the file's
+    // current folder (so a rename-in-place via dest_name still works).
+    let target_folder: PathBuf = if let Some(folder) =
+        dest_folder.filter(|f| !f.trim().is_empty())
+    {
+        resolve_gallery_path(&app, Some(folder))?
+    } else {
+        src.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| gallery_dir(&app))
+    };
+
+    // Resolve target filename. dest_name is the user's chosen name from
+    // the picker's filename input. We sanitize it (no path separators or
+    // Windows-illegal chars), strip any trailing ".png" the user typed,
+    // then force ".png" back on so the file always has the right
+    // extension. Falling back to the source filename when nothing was
+    // passed keeps existing callers (auto-save on minimize) working
+    // unchanged.
+    let target_filename: std::ffi::OsString = if let Some(name) =
+        dest_name.filter(|n| !n.trim().is_empty())
+    {
+        let safe = sanitize_folder_name(&name)?;
+        let lower = safe.to_ascii_lowercase();
+        let stem = if lower.ends_with(".png") {
+            safe[..safe.len() - 4].trim().to_string()
+        } else {
+            safe
+        };
+        if stem.is_empty() {
+            return Err("File name cannot be empty".into());
+        }
+        format!("{stem}.png").into()
+    } else {
+        src.file_name()
+            .ok_or_else(|| "Source has no filename".to_string())?
+            .to_os_string()
+    };
+
+    let candidate = target_folder.join(&target_filename);
+
+    let final_path = if candidate == src {
+        // Same destination — UI gating already prevents redundant saves
+        // for files the user has explicitly saved before; for fresh
+        // screenshots a no-op rewrite is harmless and lets the first
+        // save "just work".
+        candidate
+    } else if candidate.exists() {
+        if !has_edits {
+            return Err(
+                "A file with that name already exists in the destination".into(),
+            );
+        }
+        // Has edits + name conflict → save alongside as a new file.
+        let target_path = Path::new(&target_filename);
+        let stem = target_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("shot")
+            .to_string();
+        let ext = target_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("png")
+            .to_string();
+        let mut idx = 1u32;
+        loop {
+            let attempt = target_folder.join(format!("{stem}_{idx}.{ext}"));
+            if !attempt.exists() {
+                break attempt;
+            }
+            idx += 1;
+        }
+    } else {
+        candidate
+    };
+
+    save_png_fast(&final_path, &img)?;
+    // If the user picked a different folder, the original file in the
+    // old location is now stale — remove it so we don't leave duplicates
+    // scattered around the gallery.
+    if final_path != src && src.exists() {
+        let _ = std::fs::remove_file(&src);
+    }
+
     let preview = STANDARD.encode(encode_preview_png(&img)?);
     let payload = ThumbnailPayload {
-        path,
+        path: final_path.to_string_lossy().to_string(),
         image: preview,
     };
 

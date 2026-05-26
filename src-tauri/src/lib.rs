@@ -15,6 +15,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Pre-create hidden overlay window so first show is instant
             window::create_overlay(app.handle())?;
@@ -84,6 +85,7 @@ pub fn run() {
             capture::get_thumbnail_data,
             capture::get_image_data,
             capture::save_edited_thumbnail,
+            capture::export_png_to_path,
             capture::list_gallery_items,
             capture::list_gallery_tree,
             capture::get_gallery_preview,

@@ -331,8 +331,11 @@ function FolderTreeNode({
   const isSelected = isRoot ? currentPath === null : currentPath === node.path;
   const isDropTarget = dropTargetPath === (isRoot ? "" : node.path);
   const hasChildren = node.children.length > 0;
-  // Root is always treated as expanded so its children are visible by default.
-  const isExpanded = isRoot ? true : expanded.has(node.path);
+  // Root uses a sentinel key in the expanded set so it can be collapsed
+  // independently of any sub-folder. openSavePicker / GallerySection
+  // seeds it on first mount so the default is expanded.
+  const ROOT_KEY = "__root__";
+  const isExpanded = isRoot ? expanded.has(ROOT_KEY) : expanded.has(node.path);
 
   return (
     <>
@@ -349,17 +352,17 @@ function FolderTreeNode({
         style={{ paddingLeft: 6 + depth * 12 }}
         title={node.path}
       >
-        {hasChildren && !isRoot ? (
+        {hasChildren ? (
           <button
             onPointerDown={(e) => e.stopPropagation()}
-            onClick={(e) => { e.stopPropagation(); onToggleExpand(node.path); }}
-            className="w-5 h-5 flex items-center justify-center shrink-0 rounded hover:bg-white/15 text-white/75"
+            onClick={(e) => { e.stopPropagation(); onToggleExpand(isRoot ? ROOT_KEY : node.path); }}
+            className="w-6 h-6 flex items-center justify-center shrink-0 rounded hover:bg-white/18 text-white/80 hover:text-white"
             title={isExpanded ? "Collapse" : "Expand"}
             aria-label={isExpanded ? "Collapse" : "Expand"}
           >
             <svg
-              width="12"
-              height="12"
+              width="14"
+              height="14"
               viewBox="0 0 24 24"
               fill="none"
               aria-hidden="true"
@@ -368,13 +371,13 @@ function FolderTreeNode({
                 transition: "transform 140ms ease",
               }}
             >
-              <path d="M9 6l6 6-6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+              <path d="M9 6l6 6-6 6" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
           </button>
         ) : (
           // Keep the same indent slot so folder icons stay aligned whether or
-          // not the node has children / is the root.
-          <span className="w-5 h-5 shrink-0" aria-hidden="true" />
+          // not the node has children.
+          <span className="w-6 h-6 shrink-0" aria-hidden="true" />
         )}
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true" className="shrink-0">
           <path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
@@ -538,6 +541,21 @@ function GallerySection({ onClose, onViewItem }: { onClose: () => void; onViewIt
 
   const refreshTree = useCallback(() => {
     invoke<FolderNode>("list_gallery_tree").then(setTree).catch(console.error);
+  }, []);
+
+  // Default the root node to expanded on first mount so the user sees
+  // the gallery contents without having to click. After this we leave
+  // the set alone — whatever the user collapses stays collapsed.
+  const rootSeededRef = useRef(false);
+  useEffect(() => {
+    if (rootSeededRef.current) return;
+    rootSeededRef.current = true;
+    setExpandedFolders((prev) => {
+      if (prev.has("__root__")) return prev;
+      const next = new Set(prev);
+      next.add("__root__");
+      return next;
+    });
   }, []);
 
   const refreshItems = useCallback((folder: string | null) => {

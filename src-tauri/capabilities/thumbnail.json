@@ -5,6 +5,7 @@
   "windows": ["thumbnail-0", "thumbnail-1", "thumbnail-2", "thumbnail-3", "thumbnail-4", "preview-transition", "drag-cancel"],
   "permissions": [
     "core:default",
-    "core:window:allow-start-dragging"
+    "core:window:allow-start-dragging",
+    "dialog:default"
   ]
 }
