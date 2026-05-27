@@ -19,19 +19,61 @@ type Mode = "select" | "crop";
 interface Point { x: number; y: number }
 interface Rect  { x: number; y: number; w: number; h: number }
 
-const SHOT_SFX_OFFSET_SECONDS = 0;
 const OVERLAY_CLOSE_MS = 130;
 const GALLERY_PREVIEW_LOADING_KEY = "liem-capture:gallery-preview-loading";
-const shotSfx = new Audio("/sfx/shot_sfx.mp3");
-shotSfx.preload = "auto";
-shotSfx.volume = 0.62;
-shotSfx.load();
+
+// Shot sfx via Web Audio API. Using <audio> elements with cloneNode was
+// unreliable: clones sometimes played silent, and WebView2 throttles audio
+// in hidden windows — which we are, by the time the capture invokes start.
+// AudioContext writes straight to the OS mixer and keeps playing once a
+// BufferSource is started, regardless of whether our webview is visible.
+const SHOT_SFX_VOLUME = 0.95;
+let shotSfxCtx: AudioContext | null = null;
+let shotSfxBuffer: AudioBuffer | null = null;
+let shotSfxLoadPromise: Promise<void> | null = null;
+
+function ensureShotSfxLoaded(): Promise<void> {
+  if (shotSfxLoadPromise) return shotSfxLoadPromise;
+  shotSfxLoadPromise = (async () => {
+    try {
+      const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AC) return;
+      shotSfxCtx = new AC();
+      const res = await fetch("/sfx/shot_sfx.mp3");
+      const bytes = await res.arrayBuffer();
+      shotSfxBuffer = await shotSfxCtx.decodeAudioData(bytes);
+    } catch (err) {
+      console.error("[sfx] preload failed", err);
+    }
+  })();
+  return shotSfxLoadPromise;
+}
+
+void ensureShotSfxLoaded();
 
 function playShotSfx() {
-  const audio = shotSfx.cloneNode(true) as HTMLAudioElement;
-  audio.volume = shotSfx.volume;
-  audio.currentTime = SHOT_SFX_OFFSET_SECONDS;
-  audio.play().catch(() => {});
+  // If a user-gesture autoplay policy left the context "suspended", resuming
+  // here is free since we're inside an actual user interaction handler.
+  const ctx = shotSfxCtx;
+  const buf = shotSfxBuffer;
+  if (!ctx || !buf) {
+    // Buffer not ready yet — fall back to a fresh <audio> so the first
+    // capture after launch still beeps. Subsequent calls will hit the
+    // Web Audio fast path.
+    const audio = new Audio("/sfx/shot_sfx.mp3");
+    audio.volume = SHOT_SFX_VOLUME;
+    audio.play().catch(() => {});
+    return;
+  }
+  if (ctx.state === "suspended") {
+    void ctx.resume().catch(() => {});
+  }
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  const gain = ctx.createGain();
+  gain.gain.value = SHOT_SFX_VOLUME;
+  src.connect(gain).connect(ctx.destination);
+  src.start(0);
 }
 
 function toRect(a: Point, b: Point): Rect {
@@ -1570,11 +1612,6 @@ function SettingsPanel({
     setRecordingOverlayAction(action);
   }, []);
 
-  const resetOverlayShortcuts = useCallback(() => {
-    setOverlayShortcutError("");
-    onOverlayShortcutsChange({ ...DEFAULT_OVERLAY_SHORTCUTS });
-  }, [onOverlayShortcutsChange]);
-
   useEffect(() => {
     if (!recordingHotkey) setLiveHotkeyTokens([]);
   }, [hotkey, recordingHotkey]);
@@ -1786,13 +1823,6 @@ function SettingsPanel({
               <div className="border-t border-white/[0.07] pt-4">
                 <div className="flex items-center justify-between mb-3">
                   <div className="text-white/85 text-xs font-semibold">In-overlay shortcuts</div>
-                  <button
-                    onClick={resetOverlayShortcuts}
-                    disabled={!!recordingOverlayAction}
-                    className="text-[10px] text-white/45 hover:text-white/80 transition-colors disabled:opacity-40"
-                  >
-                    Reset
-                  </button>
                 </div>
                 <div className="flex flex-col gap-1.5">
                   {(["area", "fullscreen", "gallery", "settings"] as const).map((action) => {
@@ -2121,7 +2151,7 @@ function ModeSelector({
                     showKeyboardFocus && focusedKey === "gallery" ? "ring-2 ring-white/55 border-white/30 bg-zinc-800/95" : "",
                   ].join(" ")}
                 >
-                  <kbd className="absolute top-2 right-2 px-1.5 py-0.5 rounded-md bg-white/[0.08] border border-white/[0.12] text-white/82 text-[10px] font-mono">
+                  <kbd className="absolute top-2 left-2 px-1.5 py-0.5 rounded-md bg-white/[0.08] border border-white/[0.12] text-white/82 text-[10px] font-mono">
                     {shortcuts.gallery.toUpperCase()}
                   </kbd>
                   <span className="w-16 h-16 rounded-2xl bg-white/[0.08] border border-white/[0.12] text-white/88 flex items-center justify-center">
@@ -2141,7 +2171,7 @@ function ModeSelector({
                     showKeyboardFocus && focusedKey === "settings" ? "ring-2 ring-white/55 border-white/30 bg-zinc-800/95" : "",
                   ].join(" ")}
                 >
-                  <kbd className="absolute top-2 right-2 px-1.5 py-0.5 rounded-md bg-white/[0.08] border border-white/[0.12] text-white/82 text-[10px] font-mono">
+                  <kbd className="absolute top-2 left-2 px-1.5 py-0.5 rounded-md bg-white/[0.08] border border-white/[0.12] text-white/82 text-[10px] font-mono">
                     {shortcuts.settings.toUpperCase()}
                   </kbd>
                   <span className="w-16 h-16 rounded-2xl bg-white/[0.08] border border-white/[0.12] text-white/88 flex items-center justify-center">
@@ -2346,8 +2376,11 @@ export default function Overlay() {
       modeRef.current = "crop";
     } else if (action === "fullscreen") {
       void (async () => {
-        await hideOverlayBeforeCapture();
+        // Fire sfx BEFORE hiding so the audio stream starts while our
+        // webview is still visible (WebView2 suppresses audio in hidden
+        // windows). Web Audio's OS mixer continues regardless.
         playShotSfx();
+        await hideOverlayBeforeCapture();
         await invoke("take_fullscreen");
       })().catch(console.error);
     }
@@ -2440,11 +2473,15 @@ export default function Overlay() {
         oy = pos.y;
       } catch {}
 
+      // Fire sfx BEFORE hiding so the audio stream starts while our
+      // webview is still visible. Web Audio drives the OS mixer directly,
+      // so playback survives the subsequent win.hide().
+      playShotSfx();
+
       // Hide immediately via Rust — fire and forget
       await hideOverlayBeforeCapture();
 
       try {
-        playShotSfx();
         await invoke("take_screenshot", {
           x:      Math.round(rect.x * dpr) + ox,
           y:      Math.round(rect.y * dpr) + oy,
