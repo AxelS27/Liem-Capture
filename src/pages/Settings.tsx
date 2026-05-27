@@ -106,17 +106,17 @@ export default function Settings() {
     const pressedModifiers = new Set<string>();
     const pressedMainKeys = new Set<string>();
     let done = false;
-    let superDown = false;
 
     const tokensFromState = () => {
-      const orderedModifiers = ["Ctrl", "Shift", "Alt", "Super"].filter((token) => {
-        return pressedModifiers.has(token) || (token === "Super" && superDown);
+      // Windows key intentionally excluded — see Overlay.tsx for rationale.
+      const orderedModifiers = ["Ctrl", "Shift", "Alt"].filter((token) => {
+        return pressedModifiers.has(token);
       });
       return [...orderedModifiers, ...pressedMainKeys];
     };
 
     const hasMainKey = (tokens: string[]) => {
-      return tokens.some((token) => !["Ctrl", "Shift", "Alt", "Super"].includes(token));
+      return tokens.some((token) => !["Ctrl", "Shift", "Alt"].includes(token));
     };
 
     const stop = () => {
@@ -130,17 +130,8 @@ export default function Settings() {
     };
 
     const unlistenSuper = listen<{ down: boolean }>("liem-hotkey-super", (event) => {
-      superDown = event.payload.down;
-      if (superDown) {
-        pressedModifiers.add("Super");
-        setDraftTokens(tokensFromState());
-        return;
-      }
-      pressedModifiers.delete("Super");
-      if (!superDown && pressedCodes.size === 0) {
-        setDraftTokens([]);
-      } else {
-        setDraftTokens(tokensFromState());
+      if (event.payload.down) {
+        setError("Windows key tidak didukung — pakai Ctrl / Shift / Alt");
       }
     });
 

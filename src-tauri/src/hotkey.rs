@@ -97,6 +97,10 @@ fn set_capture_hotkey_inner(
     if persist {
         save_hotkey(app, &normalized)?;
     }
+    // Keep the tray menu's "Open Liem Capture" entry in sync with the
+    // active combo. No-op until the tray has finished building (the menu
+    // item slot is populated during the setup hook).
+    crate::refresh_capture_menu_label(&normalized);
     Ok(normalized)
 }
 
@@ -261,7 +265,15 @@ mod global_hotkey_hook {
                             return LRESULT(1);
                         }
 
+                        // Swallow only NON-modifier combo keys (e.g. "C", "F",
+                        // "2") while a combo modifier is held. Without the
+                        // `!is_modifier` guard the block would also eat plain
+                        // Ctrl / Shift / Alt presses (because a modifier is
+                        // trivially in its own combo + in `pressed`), which
+                        // broke every Ctrl-shortcut in every other app and
+                        // even prevented typing capital letters with Shift.
                         if enabled
+                            && !is_modifier(&token)
                             && combo.iter().any(|item| is_modifier(item))
                             && combo
                                 .iter()
@@ -344,7 +356,10 @@ mod recording_hook {
     use windows::Win32::{
         Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM},
         UI::{
-            Input::KeyboardAndMouse::{VK_LWIN, VK_RWIN},
+            Input::KeyboardAndMouse::{
+                GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+                KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_LWIN, VK_RWIN,
+            },
             WindowsAndMessaging::{
                 CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
                 WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
@@ -384,6 +399,37 @@ mod recording_hook {
         CallNextHookEx(HHOOK::default(), code, wparam, lparam)
     }
 
+    /// Synthesize a key-up for both Win keys via SendInput. Used when the
+    /// recording hook starts / stops to guarantee Windows' own key-state
+    /// machine matches reality, even if the user pressed Win+Shift+R (which
+    /// Win11 captures for Snipping Tool *before* our LL hook can swallow it,
+    /// leaving Win "stuck down" in OS state until the next physical press).
+    fn release_win_keys() {
+        unsafe {
+            for vk in [VK_LWIN, VK_RWIN] {
+                // Only inject the release if the OS currently believes the
+                // key is held — otherwise we'd be sending phantom Win-ups
+                // that could trip other shortcut layers.
+                if GetAsyncKeyState(vk.0 as i32) as u32 & 0x8000 == 0 {
+                    continue;
+                }
+                let input = INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(vk.0),
+                            wScan: 0,
+                            dwFlags: KEYEVENTF_KEYUP,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                };
+                SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+            }
+        }
+    }
+
     pub fn start() -> Result<(), String> {
         let mut slot = hook_slot().lock().map_err(|e| e.to_string())?;
         if slot.is_some() {
@@ -394,6 +440,11 @@ mod recording_hook {
         }
         .map_err(|e| e.to_string())?;
         *slot = Some(hook.0 as isize);
+        drop(slot);
+        // Clear any leftover Win-down OS state before the user starts
+        // pressing keys, so e.g. an OS-shortcut leak from a previous attempt
+        // doesn't poison this recording session.
+        release_win_keys();
         Ok(())
     }
 
@@ -403,6 +454,11 @@ mod recording_hook {
                 let _ = unsafe { UnhookWindowsHookEx(HHOOK(hook as *mut c_void)) };
             }
         }
+        // Clean up the OS Win-down state once the hook is gone. This fixes
+        // "Windows menu opens in background after recording" — when the user
+        // tried Win+Shift+R (Snipping Tool), Windows captured Win-down before
+        // our hook, then our hook swallowed the Win-up, leaving Win stuck.
+        release_win_keys();
     }
 }
 

@@ -52,10 +52,68 @@ function drawCanvas(canvas: HTMLCanvasElement, rect: Rect | null) {
   }
 }
 
-const MODES = [
-  { key: "1", label: "Area",       disabled: false },
-  { key: "2", label: "Fullscreen", disabled: false },
-  { key: "3", label: "Scroll",     disabled: true  },
+type OverlayAction = "area" | "fullscreen" | "gallery" | "settings";
+
+type OverlayShortcuts = Record<OverlayAction, string>;
+
+const OVERLAY_SHORTCUTS_KEY = "liem-capture:overlay-shortcuts";
+
+const DEFAULT_OVERLAY_SHORTCUTS: OverlayShortcuts = {
+  area: "1",
+  fullscreen: "2",
+  gallery: "g",
+  settings: "s",
+};
+
+// Single character a-z or 0-9. Modifiers (Ctrl/Shift/Alt) are not allowed —
+// these shortcuts only fire while the overlay is already foreground, so we
+// keep them simple and conflict-free with the global capture hotkey.
+function isValidOverlayKey(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z0-9]$/i.test(value);
+}
+
+function loadOverlayShortcuts(): OverlayShortcuts {
+  try {
+    const raw = window.localStorage.getItem(OVERLAY_SHORTCUTS_KEY);
+    if (!raw) return { ...DEFAULT_OVERLAY_SHORTCUTS };
+    const parsed = JSON.parse(raw) as Partial<Record<OverlayAction, unknown>>;
+    const result = { ...DEFAULT_OVERLAY_SHORTCUTS };
+    for (const action of ["area", "fullscreen", "gallery", "settings"] as const) {
+      const v = parsed[action];
+      if (isValidOverlayKey(v)) result[action] = v.toLowerCase();
+    }
+    // De-duplicate: if two actions collide (corrupted storage), fall back
+    // to defaults so the user isn't stuck with broken shortcuts.
+    const seen = new Set<string>();
+    for (const action of ["area", "fullscreen", "gallery", "settings"] as const) {
+      if (seen.has(result[action])) return { ...DEFAULT_OVERLAY_SHORTCUTS };
+      seen.add(result[action]);
+    }
+    return result;
+  } catch {
+    return { ...DEFAULT_OVERLAY_SHORTCUTS };
+  }
+}
+
+function saveOverlayShortcuts(value: OverlayShortcuts) {
+  try {
+    window.localStorage.setItem(OVERLAY_SHORTCUTS_KEY, JSON.stringify(value));
+  } catch {
+    // Non-fatal; user just won't have persistence.
+  }
+}
+
+const OVERLAY_ACTION_LABELS: Record<OverlayAction, string> = {
+  area: "Area capture",
+  fullscreen: "Fullscreen capture",
+  gallery: "Open gallery",
+  settings: "Open settings",
+};
+
+const BASE_MODES = [
+  { id: "area" as const,       label: "Area",       disabled: false },
+  { id: "fullscreen" as const, label: "Fullscreen", disabled: false },
+  { id: "scroll" as const,     label: "Scroll",     disabled: true  },
 ] as const;
 
 type GalleryPreviewLoading = "on-demand" | "auto";
@@ -1439,7 +1497,7 @@ const SELECTOR_ICON_CLASS =
   "w-6 h-6 rounded-md bg-white/[0.08] border border-white/[0.12] text-white/88 flex items-center justify-center shrink-0";
 
 function defaultSelectorFocusKey() {
-  const first = MODES.findIndex((m) => !m.disabled);
+  const first = BASE_MODES.findIndex((m) => !m.disabled);
   return first === -1 ? "gallery" : `mode-${first + 1}`;
 }
 
@@ -1448,17 +1506,74 @@ function SettingsPanel({
   onPreviewLoadingChange,
   hotkey,
   onHotkeyApplied,
+  overlayShortcuts,
+  onOverlayShortcutsChange,
 }: {
   previewLoading: GalleryPreviewLoading;
   onPreviewLoadingChange: (value: GalleryPreviewLoading) => void;
   hotkey: string;
   onHotkeyApplied: (value: string) => void;
+  overlayShortcuts: OverlayShortcuts;
+  onOverlayShortcutsChange: (next: OverlayShortcuts) => void;
 }) {
   const [tab, setTab] = useState<"hotkey" | "preferences">("hotkey");
   const [recordingHotkey, setRecordingHotkey] = useState(false);
   const [liveHotkeyTokens, setLiveHotkeyTokens] = useState<string[]>([]);
   const [hotkeyStatus, setHotkeyStatus] = useState("");
   const hotkeyEditAppliedRef = useRef(false);
+  // Which overlay action's shortcut is currently being captured (null = idle).
+  const [recordingOverlayAction, setRecordingOverlayAction] = useState<OverlayAction | null>(null);
+  const [overlayShortcutError, setOverlayShortcutError] = useState<string>("");
+
+  // Capture loop for the in-overlay shortcut rebinder. Listens for the next
+  // a-z / 0-9 keypress, validates uniqueness against the other 3 shortcuts,
+  // and persists. Esc cancels.
+  useEffect(() => {
+    if (!recordingOverlayAction) return;
+    const action = recordingOverlayAction;
+    const onKey = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      if (e.repeat) return;
+      if (e.key === "Escape") {
+        setRecordingOverlayAction(null);
+        setOverlayShortcutError("");
+        return;
+      }
+      if (e.ctrlKey || e.altKey || e.metaKey) {
+        setOverlayShortcutError("Modifier tidak dipakai — tekan huruf / angka aja");
+        return;
+      }
+      const key = e.key.toLowerCase();
+      if (!/^[a-z0-9]$/.test(key)) {
+        setOverlayShortcutError("Cuma huruf a-z atau angka 0-9");
+        return;
+      }
+      // Reject if another action already owns this key.
+      const conflict = (Object.entries(overlayShortcuts) as [OverlayAction, string][])
+        .find(([a, v]) => a !== action && v === key);
+      if (conflict) {
+        setOverlayShortcutError(`"${key.toUpperCase()}" sudah dipakai ${OVERLAY_ACTION_LABELS[conflict[0]]}`);
+        return;
+      }
+      onOverlayShortcutsChange({ ...overlayShortcuts, [action]: key });
+      setRecordingOverlayAction(null);
+      setOverlayShortcutError("");
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [recordingOverlayAction, overlayShortcuts, onOverlayShortcutsChange]);
+
+  const startOverlayShortcutEdit = useCallback((action: OverlayAction) => {
+    setOverlayShortcutError("");
+    setRecordingOverlayAction(action);
+  }, []);
+
+  const resetOverlayShortcuts = useCallback(() => {
+    setOverlayShortcutError("");
+    onOverlayShortcutsChange({ ...DEFAULT_OVERLAY_SHORTCUTS });
+  }, [onOverlayShortcutsChange]);
 
   useEffect(() => {
     if (!recordingHotkey) setLiveHotkeyTokens([]);
@@ -1469,7 +1584,7 @@ function SettingsPanel({
       const applied = await invoke<string>("set_capture_hotkey", { shortcut: spec });
       hotkeyEditAppliedRef.current = true;
       onHotkeyApplied(applied);
-      setHotkeyStatus("Applied");
+      setHotkeyStatus("");
     } catch (error) {
       setHotkeyStatus(String(error));
       void invoke("resume_capture_hotkey").catch(console.error);
@@ -1498,17 +1613,21 @@ function SettingsPanel({
     const pressedMainKeys = new Set<string>();
     let capturedTokens: string[] = [];
     let applied = false;
-    let superDown = false;
 
     const tokensFromState = () => {
-      const orderedModifiers = ["Ctrl", "Shift", "Alt", "Super"].filter((token) => {
-        return pressedModifiers.has(token) || (token === "Super" && superDown);
+      // Windows key is intentionally excluded — Win-anything is reserved
+      // by the OS (Win+R, Win+Shift+S, etc.) and even when our LL hook
+      // swallows the down event, Windows often grabs the shortcut first,
+      // leaving Win "stuck" in OS state. We just refuse the key outright
+      // in the recorder instead of pretending it's a valid modifier.
+      const orderedModifiers = ["Ctrl", "Shift", "Alt"].filter((token) => {
+        return pressedModifiers.has(token);
       });
       return [...orderedModifiers, ...pressedMainKeys];
     };
 
     const hasMainKey = (tokens: string[]) => {
-      return tokens.some((token) => !["Ctrl", "Shift", "Alt", "Super"].includes(token));
+      return tokens.some((token) => !["Ctrl", "Shift", "Alt"].includes(token));
     };
 
     const cancelRecording = () => {
@@ -1519,18 +1638,11 @@ function SettingsPanel({
       void invoke("resume_capture_hotkey").catch(console.error);
     };
 
+    // Surface a friendly rejection the moment a Win key is pressed so the
+    // user knows why nothing showed up in the chip row.
     const unlistenSuper = listen<{ down: boolean }>("liem-hotkey-super", (event) => {
-      superDown = event.payload.down;
-      if (superDown) {
-        pressedModifiers.add("Super");
-        setLiveHotkeyTokens(tokensFromState());
-        return;
-      }
-      pressedModifiers.delete("Super");
-      if (!superDown && pressedCodes.size === 0) {
-        setLiveHotkeyTokens([]);
-      } else {
-        setLiveHotkeyTokens(tokensFromState());
+      if (event.payload.down) {
+        setHotkeyStatus("Windows key tidak didukung — pakai Ctrl / Shift / Alt");
       }
     });
 
@@ -1670,6 +1782,57 @@ function SettingsPanel({
                     : hotkeyStatus}
                 </div>
               </div>
+
+              <div className="border-t border-white/[0.07] pt-4">
+                <div className="flex items-center justify-between mb-3">
+                  <div className="text-white/85 text-xs font-semibold">In-overlay shortcuts</div>
+                  <button
+                    onClick={resetOverlayShortcuts}
+                    disabled={!!recordingOverlayAction}
+                    className="text-[10px] text-white/45 hover:text-white/80 transition-colors disabled:opacity-40"
+                  >
+                    Reset
+                  </button>
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  {(["area", "fullscreen", "gallery", "settings"] as const).map((action) => {
+                    const recording = recordingOverlayAction === action;
+                    return (
+                      <div
+                        key={action}
+                        className={[
+                          "h-10 flex items-center gap-3 px-3 rounded-lg border transition-colors",
+                          recording ? "border-blue-300/30 bg-blue-400/[0.07]" : "border-white/[0.08] bg-zinc-950/70",
+                        ].join(" ")}
+                      >
+                        <span className="flex-1 text-white/82 text-xs">{OVERLAY_ACTION_LABELS[action]}</span>
+                        <kbd className="px-2 py-1 rounded-md bg-white/[0.08] border border-white/[0.12] text-white/85 text-xs font-mono min-w-7 text-center">
+                          {recording ? "…" : overlayShortcuts[action].toUpperCase()}
+                        </kbd>
+                        <button
+                          onClick={() => {
+                            if (recording) {
+                              setRecordingOverlayAction(null);
+                              setOverlayShortcutError("");
+                            } else {
+                              startOverlayShortcutEdit(action);
+                            }
+                          }}
+                          disabled={!!recordingOverlayAction && !recording}
+                          className="h-7 px-2.5 rounded-md border border-white/[0.10] bg-zinc-900/80 hover:bg-zinc-800/95 text-white/82 text-[11px] font-semibold transition-colors disabled:opacity-50"
+                        >
+                          {recording ? "Cancel" : "Edit"}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="mt-2 min-h-4 text-[11px] text-white/48">
+                  {recordingOverlayAction
+                    ? overlayShortcutError || "Tekan huruf / angka. Esc batal."
+                    : overlayShortcutError}
+                </div>
+              </div>
             </div>
           ) : (
             <div>
@@ -1705,10 +1868,14 @@ function ModeSelector({
   isClosing,
   onSelect,
   onClose,
+  shortcuts,
+  onShortcutsChange,
 }: {
   isClosing: boolean;
   onSelect: (key: string) => void;
   onClose: () => void;
+  shortcuts: OverlayShortcuts;
+  onShortcutsChange: (next: OverlayShortcuts) => void;
 }) {
   const [viewingItem, setViewingItem] = useState<GalleryItem | null>(null);
   const [selectorView, setSelectorView] = useState<"menu" | "gallery" | "settings">("menu");
@@ -1797,9 +1964,9 @@ function ModeSelector({
 
       type Item = { id: string; row: number; col: number; disabled: boolean; action: () => void };
       const items: Item[] = [
-        { id: "mode-1", row: 0, col: 0, disabled: MODES[0].disabled, action: () => onSelect(MODES[0].key) },
-        { id: "mode-2", row: 0, col: 1, disabled: MODES[1].disabled, action: () => onSelect(MODES[1].key) },
-        { id: "mode-3", row: 0, col: 2, disabled: MODES[2].disabled, action: () => onSelect(MODES[2].key) },
+        { id: "mode-1", row: 0, col: 0, disabled: BASE_MODES[0].disabled, action: () => onSelect("area") },
+        { id: "mode-2", row: 0, col: 1, disabled: BASE_MODES[1].disabled, action: () => onSelect("fullscreen") },
+        { id: "mode-3", row: 0, col: 2, disabled: BASE_MODES[2].disabled, action: () => onSelect("scroll") },
         { id: "gallery", row: 1, col: 0, disabled: false, action: () => setSelectorView("gallery") },
         { id: "settings", row: 1, col: 1, disabled: false, action: () => setSelectorView("settings") },
       ];
@@ -1855,11 +2022,25 @@ function ModeSelector({
         e.preventDefault();
         e.stopPropagation();
         current.action();
+      } else if (!e.ctrlKey && !e.altKey && !e.metaKey) {
+        // Customizable quick-jump shortcuts: gallery / settings. The area /
+        // fullscreen shortcuts are handled by the outer Overlay keydown so
+        // they can fire whether we're on the menu or already mid-capture.
+        const k = e.key.toLowerCase();
+        if (k === shortcuts.gallery) {
+          e.preventDefault();
+          e.stopPropagation();
+          setSelectorView("gallery");
+        } else if (k === shortcuts.settings) {
+          e.preventDefault();
+          e.stopPropagation();
+          setSelectorView("settings");
+        }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [focusedKey, onSelect, selectorView, showKeyboardFocus, viewingItem]);
+  }, [focusedKey, onSelect, selectorView, shortcuts.gallery, shortcuts.settings, showKeyboardFocus, viewingItem]);
 
   return (
     <motion.div
@@ -1897,15 +2078,20 @@ function ModeSelector({
               </div>
 
               <div className="px-3 pb-3 grid grid-cols-3 gap-2">
-                {MODES.map((m, i) => {
+                {BASE_MODES.map((m, i) => {
                   const focused = showKeyboardFocus && focusedKey === `mode-${i + 1}`;
+                  const keyLabel = m.id === "area"
+                    ? shortcuts.area.toUpperCase()
+                    : m.id === "fullscreen"
+                      ? shortcuts.fullscreen.toUpperCase()
+                      : "·"; // scroll is disabled, no shortcut
                   return (
                   <button
-                    key={m.key}
+                    key={m.id}
                     disabled={m.disabled}
                     onClick={(event) => {
                       event.currentTarget.blur();
-                      if (!m.disabled) onSelect(m.key);
+                      if (!m.disabled) onSelect(m.id);
                     }}
                     onMouseEnter={() => !m.disabled && setFocusedKey(`mode-${i + 1}`)}
                     className={[
@@ -1915,7 +2101,7 @@ function ModeSelector({
                     ].join(" ")}
                   >
                     <kbd className={SELECTOR_ICON_CLASS + " text-xs font-mono shadow-sm"}>
-                      {m.key}
+                      {keyLabel}
                     </kbd>
                     <span className="text-white text-sm font-semibold drop-shadow-sm min-w-0 truncate">{m.label}</span>
                     {m.disabled && (
@@ -1931,9 +2117,13 @@ function ModeSelector({
                   onMouseEnter={() => setFocusedKey("gallery")}
                   className={[
                     SELECTOR_ACTION_CLASS,
+                    "relative",
                     showKeyboardFocus && focusedKey === "gallery" ? "ring-2 ring-white/55 border-white/30 bg-zinc-800/95" : "",
                   ].join(" ")}
                 >
+                  <kbd className="absolute top-2 right-2 px-1.5 py-0.5 rounded-md bg-white/[0.08] border border-white/[0.12] text-white/82 text-[10px] font-mono">
+                    {shortcuts.gallery.toUpperCase()}
+                  </kbd>
                   <span className="w-16 h-16 rounded-2xl bg-white/[0.08] border border-white/[0.12] text-white/88 flex items-center justify-center">
                     <svg width="34" height="34" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                       <path d="M4 6a2 2 0 012-2h12a2 2 0 012 2v12a2 2 0 01-2 2H6a2 2 0 01-2-2V6z" stroke="currentColor" strokeWidth="1.8" />
@@ -1947,9 +2137,13 @@ function ModeSelector({
                   onMouseEnter={() => setFocusedKey("settings")}
                   className={[
                     SELECTOR_ACTION_CLASS,
+                    "relative",
                     showKeyboardFocus && focusedKey === "settings" ? "ring-2 ring-white/55 border-white/30 bg-zinc-800/95" : "",
                   ].join(" ")}
                 >
+                  <kbd className="absolute top-2 right-2 px-1.5 py-0.5 rounded-md bg-white/[0.08] border border-white/[0.12] text-white/82 text-[10px] font-mono">
+                    {shortcuts.settings.toUpperCase()}
+                  </kbd>
                   <span className="w-16 h-16 rounded-2xl bg-white/[0.08] border border-white/[0.12] text-white/88 flex items-center justify-center">
                     <svg width="34" height="34" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                       <path d="M12 15.5a3.5 3.5 0 100-7 3.5 3.5 0 000 7z" stroke="currentColor" strokeWidth="1.8" />
@@ -2012,6 +2206,8 @@ function ModeSelector({
                 onPreviewLoadingChange={handlePreviewLoadingChange}
                 hotkey={hotkey}
                 onHotkeyApplied={setHotkey}
+                overlayShortcuts={shortcuts}
+                onOverlayShortcutsChange={onShortcutsChange}
               />
             </motion.div>
             )}
@@ -2034,6 +2230,20 @@ export default function Overlay() {
   const [mode, setMode] = useState<Mode>("select");
   const [overlayClosing, setOverlayClosing] = useState(false);
   const [selectorClosing, setSelectorClosing] = useState(false);
+  const [overlayShortcuts, setOverlayShortcuts] = useState<OverlayShortcuts>(() => loadOverlayShortcuts());
+  // Mirror to a ref so the outer keydown handler can stay registered once
+  // (instead of being torn down and rebuilt every time the user rebinds a
+  // shortcut, which is also the path that re-runs side effects like
+  // listening for "close-overlay").
+  const overlayShortcutsRef = useRef(overlayShortcuts);
+  useEffect(() => {
+    overlayShortcutsRef.current = overlayShortcuts;
+  }, [overlayShortcuts]);
+
+  const updateOverlayShortcuts = useCallback((next: OverlayShortcuts) => {
+    setOverlayShortcuts(next);
+    saveOverlayShortcuts(next);
+  }, []);
 
   // Keep ref in sync so event handlers always see latest mode without re-registering
   useEffect(() => { modeRef.current = mode; }, [mode]);
@@ -2130,21 +2340,21 @@ export default function Overlay() {
     drawCanvas(canvas, null);
   }, [mode]);
 
-  const handleModeSelect = useCallback((key: string) => {
-    if (key === "1") {
+  const handleModeSelect = useCallback((action: string) => {
+    if (action === "area") {
       setMode("crop");
       modeRef.current = "crop";
-    } else if (key === "2") {
+    } else if (action === "fullscreen") {
       void (async () => {
         await hideOverlayBeforeCapture();
         playShotSfx();
         await invoke("take_fullscreen");
       })().catch(console.error);
     }
-    // key "3" = coming soon
+    // "scroll" = coming soon
   }, [hideOverlayBeforeCapture]);
 
-  // ── Single keydown listener — registered once, uses ref for mode ───────────
+  // ── Single keydown listener — registered once, uses refs for latest state ─
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -2170,8 +2380,13 @@ export default function Overlay() {
         // Don't trigger mode shortcuts while viewing or while a dialog
         // is taking input — those keys belong to those UIs.
         if (viewerOpenRef.current || dialogOpenRef.current) return;
-        if (e.key === "1" || e.key === "2" || e.key === "3") {
-          handleModeSelect(e.key);
+        if (e.ctrlKey || e.altKey || e.metaKey) return;
+        const k = e.key.toLowerCase();
+        const sc = overlayShortcutsRef.current;
+        if (k === sc.area) {
+          handleModeSelect("area");
+        } else if (k === sc.fullscreen) {
+          handleModeSelect("fullscreen");
         }
       }
     };
@@ -2265,7 +2480,13 @@ export default function Overlay() {
           style={{ cursor: "crosshair", display: mode === "crop" ? "block" : "none" }}
         />
         {mode === "select" && (
-          <ModeSelector isClosing={selectorClosing} onSelect={handleModeSelect} onClose={close} />
+          <ModeSelector
+            isClosing={selectorClosing}
+            onSelect={handleModeSelect}
+            onClose={close}
+            shortcuts={overlayShortcuts}
+            onShortcutsChange={updateOverlayShortcuts}
+          />
         )}
       </motion.div>
     </DialogProvider>

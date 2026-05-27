@@ -1,7 +1,8 @@
+use std::sync::{Mutex, OnceLock};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager,
+    Wry,
 };
 
 mod ai;
@@ -10,9 +11,41 @@ mod drag;
 mod hotkey;
 mod window;
 
+/// The "Open Liem Capture" tray entry. Stored globally so `hotkey.rs` can
+/// re-label it when the user changes the capture shortcut.
+static CAPTURE_MENU_ITEM: OnceLock<Mutex<Option<MenuItem<Wry>>>> = OnceLock::new();
+
+fn capture_menu_item_slot() -> &'static Mutex<Option<MenuItem<Wry>>> {
+    CAPTURE_MENU_ITEM.get_or_init(|| Mutex::new(None))
+}
+
+fn capture_menu_label(spec: &str) -> String {
+    format!("Open  ({spec})")
+}
+
+/// Called by `hotkey::set_capture_hotkey_inner` after the shortcut is saved
+/// so the tray menu's first entry always shows the active combo.
+pub fn refresh_capture_menu_label(spec: &str) {
+    let Ok(guard) = capture_menu_item_slot().lock() else {
+        return;
+    };
+    if let Some(item) = guard.as_ref() {
+        let _ = item.set_text(capture_menu_label(spec));
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Single-instance plugin: if the user double-clicks the .exe a second
+        // time (or the OS auto-starts it again), the new process exits and
+        // re-shows the overlay on the existing instance instead of producing
+        // a duplicate tray icon and a duplicate keyboard hook.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Err(e) = window::show_overlay(app) {
+                eprintln!("[single-instance] show_overlay error: {e}");
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -24,33 +57,31 @@ pub fn run() {
             window::create_drag_cancel(app.handle())?;
             window::create_thumbnail_pool(app.handle())?;
 
-            // System tray
-            let quit = MenuItem::with_id(app, "quit", "Quit Liem Capture", true, None::<&str>)?;
-            let show = MenuItem::with_id(app, "show", "Settings", true, None::<&str>)?;
+            // System tray — two entries only: open overlay (label syncs with
+            // the active hotkey) and quit.
+            let initial_spec = hotkey::get_capture_hotkey().unwrap_or_else(|_| "Ctrl+Shift+2".into());
             let capture = MenuItem::with_id(
                 app,
                 "capture",
-                "Capture  (Ctrl+Shift+2)",
+                capture_menu_label(&initial_spec),
                 true,
                 None::<&str>,
             )?;
-            let menu = Menu::with_items(app, &[&capture, &show, &quit])?;
+            if let Ok(mut slot) = capture_menu_item_slot().lock() {
+                *slot = Some(capture.clone());
+            }
+            let quit = MenuItem::with_id(app, "quit", "Exit", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&capture, &quit])?;
 
             TrayIconBuilder::new()
                 .menu(&menu)
-                .tooltip("Liem Capture. Capture. Drag. Done.")
+                .tooltip("Liem Capture")
                 .icon(app.default_window_icon().unwrap().clone())
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "quit" => app.exit(0),
                     "capture" => {
                         if let Err(e) = window::show_overlay(app) {
                             eprintln!("[tray] show_overlay error: {e}");
-                        }
-                    }
-                    "show" => {
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.set_focus();
                         }
                     }
                     _ => {}
@@ -63,13 +94,8 @@ pub fn run() {
                     } = event
                     {
                         let app = tray.app_handle();
-                        if let Some(w) = app.get_webview_window("main") {
-                            if w.is_visible().unwrap_or(false) {
-                                let _ = w.hide();
-                            } else {
-                                let _ = w.show();
-                                let _ = w.set_focus();
-                            }
+                        if let Err(e) = window::show_overlay(app) {
+                            eprintln!("[tray-click] show_overlay error: {e}");
                         }
                     }
                 })
