@@ -84,10 +84,7 @@ pub fn ai_remove_background(app: AppHandle, data_url: String) -> Result<String, 
 }
 
 fn ai_model_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let mut dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|e| e.to_string())?;
+    let mut dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
     dir.push("models");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir)
@@ -102,7 +99,10 @@ fn ensure_u2netp_model(app: &AppHandle) -> Result<PathBuf, String> {
 
     let response = reqwest::blocking::get(U2NETP_MODEL_URL).map_err(|e| e.to_string())?;
     if !response.status().is_success() {
-        return Err(format!("Could not download background model: {}", response.status()));
+        return Err(format!(
+            "Could not download background model: {}",
+            response.status()
+        ));
     }
     let bytes = response.bytes().map_err(|e| e.to_string())?;
     let tmp_path = path.with_extension("onnx.download");
@@ -152,7 +152,9 @@ fn run_u2netp_mask(app: &AppHandle, img: &RgbaImage) -> Result<image::GrayImage,
     let outputs = model
         .run(tvec!(input.into_tensor().into()))
         .map_err(|e| e.to_string())?;
-    let mask = outputs[0].to_array_view::<f32>().map_err(|e| e.to_string())?;
+    let mask = outputs[0]
+        .to_array_view::<f32>()
+        .map_err(|e| e.to_string())?;
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
     for value in mask.iter().copied() {
@@ -167,7 +169,12 @@ fn run_u2netp_mask(app: &AppHandle, img: &RgbaImage) -> Result<image::GrayImage,
             small.put_pixel(x, y, image::Luma([(value.clamp(0.0, 1.0) * 255.0) as u8]));
         }
     }
-    Ok(imageops::resize(&small, img.width(), img.height(), FilterType::Triangle))
+    Ok(imageops::resize(
+        &small,
+        img.width(),
+        img.height(),
+        FilterType::Triangle,
+    ))
 }
 
 #[command]

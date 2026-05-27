@@ -59,37 +59,7 @@ const MODES = [
 ] as const;
 
 type GalleryPreviewLoading = "on-demand" | "auto";
-type ShortcutParts = {
-  ctrl: boolean;
-  shift: boolean;
-  alt: boolean;
-  superKey: boolean;
-  key: string;
-};
-
 const DEFAULT_HOTKEY = "Ctrl+Shift+2";
-
-function parseShortcutSpec(spec: string): ShortcutParts {
-  const parts = spec.split("+").map((part) => part.trim()).filter(Boolean);
-  const key = parts[parts.length - 1] ?? "2";
-  return {
-    ctrl: parts.some((part) => /^(ctrl|control)$/i.test(part)),
-    shift: parts.some((part) => /^shift$/i.test(part)),
-    alt: parts.some((part) => /^(alt|option)$/i.test(part)),
-    superKey: parts.some((part) => /^(super|cmd|command|win|meta)$/i.test(part)),
-    key,
-  };
-}
-
-function formatShortcutSpec(parts: ShortcutParts) {
-  return [
-    parts.ctrl ? "Ctrl" : null,
-    parts.shift ? "Shift" : null,
-    parts.alt ? "Alt" : null,
-    parts.superKey ? "Super" : null,
-    parts.key,
-  ].filter(Boolean).join("+");
-}
 
 function keyFromKeyboardEvent(event: KeyboardEvent) {
   if (/^Key[A-Z]$/.test(event.code)) return event.code.slice(3);
@@ -114,6 +84,14 @@ function keyFromKeyboardEvent(event: KeyboardEvent) {
     ArrowRight: "ArrowRight",
   };
   return named[event.key] ?? null;
+}
+
+function modifierFromKeyboardCode(code: string) {
+  if (code.startsWith("Control")) return "Ctrl";
+  if (code.startsWith("Shift")) return "Shift";
+  if (code.startsWith("Alt")) return "Alt";
+  if (code.startsWith("Meta") || code === "OSLeft" || code === "OSRight") return "Super";
+  return null;
 }
 
 interface GalleryItem {
@@ -1477,75 +1455,160 @@ function SettingsPanel({
   onHotkeyApplied: (value: string) => void;
 }) {
   const [tab, setTab] = useState<"hotkey" | "preferences">("hotkey");
-  const [draftHotkey, setDraftHotkey] = useState(hotkey);
-  const [recording, setRecording] = useState<"combo" | "key" | null>(null);
+  const [recordingHotkey, setRecordingHotkey] = useState(false);
+  const [liveHotkeyTokens, setLiveHotkeyTokens] = useState<string[]>([]);
   const [hotkeyStatus, setHotkeyStatus] = useState("");
+  const hotkeyEditAppliedRef = useRef(false);
 
   useEffect(() => {
-    setDraftHotkey(hotkey);
-  }, [hotkey]);
+    if (!recordingHotkey) setLiveHotkeyTokens([]);
+  }, [hotkey, recordingHotkey]);
 
-  useEffect(() => {
-    if (!recording) return;
-    const recordingWindow = window as Window & { __LIEM_RECORDING_HOTKEY?: boolean };
-    recordingWindow.__LIEM_RECORDING_HOTKEY = true;
-    const onKey = (event: KeyboardEvent) => {
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation();
-      const key = keyFromKeyboardEvent(event);
-      if (!key) return;
-      const current = parseShortcutSpec(draftHotkey);
-      const next: ShortcutParts = recording === "combo"
-        ? {
-            ctrl: event.ctrlKey,
-            shift: event.shiftKey,
-            alt: event.altKey,
-            superKey: event.metaKey,
-            key,
-          }
-        : { ...current, key };
-      setDraftHotkey(formatShortcutSpec(next));
-      setRecording(null);
-      setHotkeyStatus("");
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => {
-      recordingWindow.__LIEM_RECORDING_HOTKEY = false;
-      window.removeEventListener("keydown", onKey, true);
-    };
-  }, [draftHotkey, recording]);
-
-  const draftParts = useMemo(() => parseShortcutSpec(draftHotkey), [draftHotkey]);
-
-  const toggleModifier = useCallback((modifier: keyof Omit<ShortcutParts, "key">) => {
-    const parts = parseShortcutSpec(draftHotkey);
-    parts[modifier] = !parts[modifier];
-    setDraftHotkey(formatShortcutSpec(parts));
-    setHotkeyStatus("");
-  }, [draftHotkey]);
-
-  const applyHotkey = useCallback(async () => {
+  const applyRecordedHotkey = useCallback(async (spec: string) => {
     try {
-      const applied = await invoke<string>("set_capture_hotkey", { shortcut: draftHotkey });
+      const applied = await invoke<string>("set_capture_hotkey", { shortcut: spec });
+      hotkeyEditAppliedRef.current = true;
       onHotkeyApplied(applied);
-      setDraftHotkey(applied);
       setHotkeyStatus("Applied");
     } catch (error) {
       setHotkeyStatus(String(error));
-    }
-  }, [draftHotkey, onHotkeyApplied]);
-
-  const resetHotkey = useCallback(async () => {
-    try {
-      const reset = await invoke<string>("reset_capture_hotkey");
-      onHotkeyApplied(reset);
-      setDraftHotkey(reset);
-      setHotkeyStatus("Reset");
-    } catch (error) {
-      setHotkeyStatus(String(error));
+      void invoke("resume_capture_hotkey").catch(console.error);
+    } finally {
+      setRecordingHotkey(false);
+      setLiveHotkeyTokens([]);
     }
   }, [onHotkeyApplied]);
+
+  const startHotkeyEdit = useCallback(() => {
+    setHotkeyStatus("Hold exactly 3 keys");
+    setLiveHotkeyTokens([]);
+    void invoke("suspend_capture_hotkey")
+      .catch(console.error)
+      .then(() => invoke("start_hotkey_recording"))
+      .catch(console.error)
+      .finally(() => setRecordingHotkey(true));
+  }, []);
+
+  useEffect(() => {
+    if (!recordingHotkey) return;
+    const recordingWindow = window as Window & { __LIEM_RECORDING_HOTKEY?: boolean };
+    recordingWindow.__LIEM_RECORDING_HOTKEY = true;
+    const pressedCodes = new Set<string>();
+    const pressedModifiers = new Set<string>();
+    const pressedMainKeys = new Set<string>();
+    let capturedTokens: string[] = [];
+    let applied = false;
+    let superDown = false;
+
+    const tokensFromState = () => {
+      const orderedModifiers = ["Ctrl", "Shift", "Alt", "Super"].filter((token) => {
+        return pressedModifiers.has(token) || (token === "Super" && superDown);
+      });
+      return [...orderedModifiers, ...pressedMainKeys];
+    };
+
+    const hasMainKey = (tokens: string[]) => {
+      return tokens.some((token) => !["Ctrl", "Shift", "Alt", "Super"].includes(token));
+    };
+
+    const cancelRecording = () => {
+      setRecordingHotkey(false);
+      setLiveHotkeyTokens([]);
+      setHotkeyStatus("");
+      void invoke("stop_hotkey_recording").catch(console.error);
+      void invoke("resume_capture_hotkey").catch(console.error);
+    };
+
+    const unlistenSuper = listen<{ down: boolean }>("liem-hotkey-super", (event) => {
+      superDown = event.payload.down;
+      if (superDown) {
+        pressedModifiers.add("Super");
+        setLiveHotkeyTokens(tokensFromState());
+        return;
+      }
+      pressedModifiers.delete("Super");
+      if (!superDown && pressedCodes.size === 0) {
+        setLiveHotkeyTokens([]);
+      } else {
+        setLiveHotkeyTokens(tokensFromState());
+      }
+    });
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      if (event.repeat) return;
+      if (event.key === "Escape" && !event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey) {
+        cancelRecording();
+        return;
+      }
+      pressedCodes.add(event.code);
+      const modifier = modifierFromKeyboardCode(event.code);
+      if (modifier) {
+        pressedModifiers.add(modifier);
+      }
+      const key = keyFromKeyboardEvent(event);
+      if (key) {
+        pressedMainKeys.add(key);
+      }
+      const tokens = tokensFromState();
+      setLiveHotkeyTokens(tokens);
+      if (tokens.length > 3) {
+        setHotkeyStatus("Use exactly 3 keys");
+        return;
+      }
+      if (tokens.length < 3 || !hasMainKey(tokens)) {
+        setHotkeyStatus("Hold exactly 3 keys");
+        return;
+      }
+      capturedTokens = tokens;
+      setHotkeyStatus("Release to apply");
+    };
+
+    const onKeyUp = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      pressedCodes.delete(event.code);
+      const modifier = modifierFromKeyboardCode(event.code);
+      if (modifier) {
+        pressedModifiers.delete(modifier);
+      }
+      const key = keyFromKeyboardEvent(event);
+      if (key) {
+        pressedMainKeys.delete(key);
+      }
+      if (pressedCodes.size > 0 || applied) return;
+      if (capturedTokens.length !== 3 || !hasMainKey(capturedTokens)) {
+        setHotkeyStatus("Hold exactly 3 keys");
+        capturedTokens = [];
+        setLiveHotkeyTokens([]);
+        return;
+      }
+      applied = true;
+      setHotkeyStatus("Applying...");
+      void applyRecordedHotkey(capturedTokens.join("+"));
+    };
+
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("keyup", onKeyUp, true);
+    return () => {
+      recordingWindow.__LIEM_RECORDING_HOTKEY = false;
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("keyup", onKeyUp, true);
+      void unlistenSuper.then((fn) => fn());
+      void invoke("stop_hotkey_recording").catch(console.error);
+      if (!hotkeyEditAppliedRef.current) {
+        void invoke("resume_capture_hotkey").catch(console.error);
+      }
+      hotkeyEditAppliedRef.current = false;
+    };
+  }, [applyRecordedHotkey, recordingHotkey]);
+
+  const visibleHotkeyTokens = recordingHotkey
+    ? liveHotkeyTokens
+    : hotkey.split("+").map((part) => part.trim()).filter(Boolean);
 
   return (
     <div className="flex flex-col">
@@ -1577,68 +1640,35 @@ function SettingsPanel({
             <div className="flex flex-col gap-4">
               <div>
                 <div className="text-white/85 text-xs font-semibold mb-3">Capture shortcut</div>
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {[
-                    ["ctrl", "Ctrl"],
-                    ["shift", "Shift"],
-                    ["alt", "Alt"],
-                    ["superKey", "Super"],
-                  ].map(([key, label]) => {
-                    const active = draftParts[key as keyof Omit<ShortcutParts, "key">];
-                    return (
-                      <button
-                        key={key}
-                        onClick={() => toggleModifier(key as keyof Omit<ShortcutParts, "key">)}
-                        className={[
-                          "px-2.5 py-1.5 rounded-md text-xs font-mono border shadow-sm transition-colors",
-                          active
-                            ? "bg-white/[0.14] text-white border-white/[0.18]"
-                            : "bg-zinc-900 text-white/38 border-white/[0.08] hover:text-white/75",
-                        ].join(" ")}
+                <div className="flex items-center gap-2">
+                  <div className={[
+                    "min-h-10 flex-1 rounded-lg border px-3 py-2 flex flex-wrap items-center gap-1.5",
+                    recordingHotkey ? "border-blue-300/30 bg-blue-400/[0.07]" : "border-white/[0.08] bg-zinc-950/70",
+                  ].join(" ")}>
+                    {visibleHotkeyTokens.length === 0 ? (
+                      <span className="text-white/35 text-xs">Hold keys...</span>
+                    ) : visibleHotkeyTokens.map((token) => (
+                      <kbd
+                        key={token}
+                        className="px-2 py-1 rounded-md bg-white/[0.10] border border-white/[0.10] text-white/82 text-xs font-mono"
                       >
-                        {label}
-                      </button>
-                    );
-                  })}
+                        {token}
+                      </kbd>
+                    ))}
+                  </div>
                   <button
-                    onClick={() => setRecording("key")}
-                    className={[
-                      "px-2.5 py-1.5 rounded-md text-xs font-mono border shadow-sm transition-colors",
-                      recording === "key"
-                        ? "bg-white/[0.22] text-white border-white/30"
-                        : "bg-zinc-900 text-white/88 border-white/[0.12] hover:bg-zinc-800",
-                    ].join(" ")}
+                    onClick={startHotkeyEdit}
+                    disabled={recordingHotkey}
+                    className="h-10 px-3 rounded-lg border border-white/[0.10] bg-zinc-900/80 hover:bg-zinc-800/95 text-white/86 text-xs font-semibold transition-colors disabled:opacity-60"
                   >
-                    {recording === "key" ? "Press key" : draftParts.key}
+                    Edit
                   </button>
                 </div>
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  onClick={() => {
-                    setRecording("combo");
-                    setHotkeyStatus("");
-                  }}
-                  className="h-8 px-3 rounded-lg border border-white/[0.10] bg-zinc-900/80 hover:bg-zinc-800/95 text-white/86 text-xs font-semibold transition-colors"
-                >
-                  {recording === "combo" ? "Press shortcut" : "Record"}
-                </button>
-                <button
-                  onClick={() => void applyHotkey()}
-                  disabled={draftHotkey === hotkey}
-                  className="h-8 px-3 rounded-lg border border-white/[0.12] bg-white/[0.12] hover:bg-white/[0.18] text-white text-xs font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  Apply
-                </button>
-                <button
-                  onClick={() => void resetHotkey()}
-                  className="h-8 px-3 rounded-lg border border-white/[0.10] bg-zinc-900/80 hover:bg-zinc-800/95 text-white/72 text-xs font-semibold transition-colors"
-                >
-                  Reset
-                </button>
-                {hotkeyStatus && (
-                  <span className="text-[11px] text-white/48">{hotkeyStatus}</span>
-                )}
+                <div className="mt-2 min-h-4 text-[11px] text-white/48">
+                  {recordingHotkey
+                    ? "Hold exactly 3 keys. The shortcut applies automatically."
+                    : hotkeyStatus}
+                </div>
               </div>
             </div>
           ) : (

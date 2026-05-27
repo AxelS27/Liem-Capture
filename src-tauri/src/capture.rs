@@ -143,7 +143,11 @@ fn build_folder_tree(path: &Path) -> FolderNode {
             }
         }
     }
-    children.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+    children.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+    });
     FolderNode {
         name,
         path: path.to_string_lossy().to_string(),
@@ -184,7 +188,10 @@ pub fn list_gallery_items(
         if !path.is_file() {
             continue;
         }
-        if path.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase())
+        if path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
             != Some("png".to_string())
         {
             continue;
@@ -222,7 +229,10 @@ fn sanitize_folder_name(name: &str) -> Result<String, String> {
     }
     // Reject path separators and Windows-illegal characters outright.
     const BANNED: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
-    if trimmed.chars().any(|c| BANNED.contains(&c) || c.is_control()) {
+    if trimmed
+        .chars()
+        .any(|c| BANNED.contains(&c) || c.is_control())
+    {
         return Err("Folder name contains illegal characters".into());
     }
     Ok(trimmed.to_string())
@@ -293,10 +303,7 @@ pub fn rename_gallery_item(
     let parent = src
         .parent()
         .ok_or_else(|| "File has no parent folder".to_string())?;
-    let ext = src
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("png");
+    let ext = src.extension().and_then(|s| s.to_str()).unwrap_or("png");
     let candidate_name = if safe.to_ascii_lowercase().ends_with(&format!(".{ext}")) {
         safe
     } else {
@@ -438,7 +445,11 @@ pub fn view_gallery_item(app: AppHandle, path: String) -> Result<(), String> {
     open_gallery_item_inner(app, path, "liem-thumbnail-auto-view")
 }
 
-fn open_gallery_item_inner(app: AppHandle, path: String, event: &'static str) -> Result<(), String> {
+fn open_gallery_item_inner(
+    app: AppHandle,
+    path: String,
+    event: &'static str,
+) -> Result<(), String> {
     // Close the overlay first so the spawned thumbnail is the only thing
     // on screen.
     window::hide_overlay(app.clone());
@@ -615,8 +626,7 @@ pub fn save_edited_thumbnail(
     let named_gallery_save = dest_name
         .as_ref()
         .is_some_and(|name| !name.trim().is_empty());
-    let target_folder: PathBuf = if let Some(folder) =
-        dest_folder.filter(|f| !f.trim().is_empty())
+    let target_folder: PathBuf = if let Some(folder) = dest_folder.filter(|f| !f.trim().is_empty())
     {
         resolve_gallery_path(&app, Some(folder))?
     } else if named_gallery_save {
@@ -634,25 +644,24 @@ pub fn save_edited_thumbnail(
     // extension. Falling back to the source filename when nothing was
     // passed keeps existing callers (auto-save on minimize) working
     // unchanged.
-    let target_filename: std::ffi::OsString = if let Some(name) =
-        dest_name.filter(|n| !n.trim().is_empty())
-    {
-        let safe = sanitize_folder_name(&name)?;
-        let lower = safe.to_ascii_lowercase();
-        let stem = if lower.ends_with(".png") {
-            safe[..safe.len() - 4].trim().to_string()
+    let target_filename: std::ffi::OsString =
+        if let Some(name) = dest_name.filter(|n| !n.trim().is_empty()) {
+            let safe = sanitize_folder_name(&name)?;
+            let lower = safe.to_ascii_lowercase();
+            let stem = if lower.ends_with(".png") {
+                safe[..safe.len() - 4].trim().to_string()
+            } else {
+                safe
+            };
+            if stem.is_empty() {
+                return Err("File name cannot be empty".into());
+            }
+            format!("{stem}.png").into()
         } else {
-            safe
+            src.file_name()
+                .ok_or_else(|| "Source has no filename".to_string())?
+                .to_os_string()
         };
-        if stem.is_empty() {
-            return Err("File name cannot be empty".into());
-        }
-        format!("{stem}.png").into()
-    } else {
-        src.file_name()
-            .ok_or_else(|| "Source has no filename".to_string())?
-            .to_os_string()
-    };
 
     let candidate = target_folder.join(&target_filename);
 
@@ -664,9 +673,7 @@ pub fn save_edited_thumbnail(
         candidate
     } else if candidate.exists() {
         if !has_edits {
-            return Err(
-                "A file with that name already exists in the destination".into(),
-            );
+            return Err("A file with that name already exists in the destination".into());
         }
         // Has edits + name conflict → save alongside as a new file.
         let target_path = Path::new(&target_filename);

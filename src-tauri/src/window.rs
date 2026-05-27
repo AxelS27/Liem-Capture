@@ -20,8 +20,7 @@ const THUMBNAIL_DISMISS_MS: u64 = 8_000;
 /// appear when a transparent webview is permanently marked excluded.
 pub fn hide_chrome_for_capture(app: &AppHandle) -> Vec<String> {
     let mut toggled = Vec::new();
-    let mut candidates: Vec<String> =
-        (0..5).map(|index| format!("thumbnail-{index}")).collect();
+    let mut candidates: Vec<String> = (0..5).map(|index| format!("thumbnail-{index}")).collect();
     candidates.push("preview-transition".to_string());
 
     for label in candidates {
@@ -51,14 +50,16 @@ pub fn restore_chrome_after_capture(app: &AppHandle, labels: Vec<String>) {
 fn set_capture_affinity(win: &tauri::WebviewWindow, exclude: bool) -> bool {
     use windows::Win32::{
         Foundation::HWND,
-        UI::WindowsAndMessaging::{
-            SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
-        },
+        UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE},
     };
 
     let Ok(hwnd) = win.hwnd() else { return false };
     let hwnd = HWND(hwnd.0 as _);
-    let affinity = if exclude { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+    let affinity = if exclude {
+        WDA_EXCLUDEFROMCAPTURE
+    } else {
+        WDA_NONE
+    };
     unsafe { SetWindowDisplayAffinity(hwnd, affinity).is_ok() }
 }
 
@@ -585,20 +586,24 @@ pub fn create_drag_cancel(app: &AppHandle) -> tauri::Result<()> {
     // handled by a real app) is treated as a cancel by the OS, and we then
     // re-show the selector overlay.
     let (x, y) = drag_cancel_position(app)?;
-    WebviewWindowBuilder::new(app, "drag-cancel", WebviewUrl::App("windows/drag-cancel.html".into()))
-        .title("")
-        .inner_size(DRAG_CANCEL_W, DRAG_CANCEL_H)
-        .position(x, y)
-        .decorations(false)
-        .transparent(true)
-        .shadow(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .resizable(false)
-        .visible(false)
-        .focused(false)
-        .disable_drag_drop_handler()
-        .build()?;
+    WebviewWindowBuilder::new(
+        app,
+        "drag-cancel",
+        WebviewUrl::App("windows/drag-cancel.html".into()),
+    )
+    .title("")
+    .inner_size(DRAG_CANCEL_W, DRAG_CANCEL_H)
+    .position(x, y)
+    .decorations(false)
+    .transparent(true)
+    .shadow(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(false)
+    .visible(false)
+    .focused(false)
+    .disable_drag_drop_handler()
+    .build()?;
 
     Ok(())
 }
@@ -683,12 +688,15 @@ fn overlay_bounds(app: &AppHandle) -> tauri::Result<(f64, f64, f64, f64)> {
 pub fn show_overlay(app: &AppHandle) -> tauri::Result<()> {
     use tauri::Emitter;
 
-    if thumbnail_previewing()
+    let previewing_busy = thumbnail_previewing()
         .lock()
         .map(|previewing| !previewing.is_empty())
-        .unwrap_or(false)
-        || has_visible_preview_thumbnail(app)
-    {
+        .unwrap_or(false);
+    let preview_visible = has_visible_preview_thumbnail(app);
+    if previewing_busy || preview_visible {
+        eprintln!(
+            "[show_overlay] suppressed: previewing_busy={previewing_busy} preview_visible={preview_visible}"
+        );
         return Ok(());
     }
 
@@ -749,6 +757,11 @@ fn hide_overlay_impl(app: &AppHandle, resume_timers: bool) {
     if let Some(win) = app.get_webview_window("overlay") {
         let _ = win.hide();
     }
+    // Flush the global hotkey hook's combo state. Without this, a latched
+    // main key (held while the user pressed Escape) or a stuck `triggered`
+    // flag would silently swallow the next combo press — the symptom being
+    // "I had to press Ctrl+C+F twice after Esc before the overlay came back."
+    crate::hotkey::clear_combo_state();
     if resume_timers {
         resume_thumbnail_timers(app);
     }
