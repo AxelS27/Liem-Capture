@@ -20,7 +20,6 @@ interface Point { x: number; y: number }
 interface Rect  { x: number; y: number; w: number; h: number }
 
 const OVERLAY_CLOSE_MS = 130;
-const GALLERY_PREVIEW_LOADING_KEY = "liem-capture:gallery-preview-loading";
 
 // Shot sfx via Web Audio API. Using <audio> elements with cloneNode was
 // unreliable: clones sometimes played silent, and WebView2 throttles audio
@@ -158,7 +157,6 @@ const BASE_MODES = [
   { id: "scroll" as const,     label: "Scroll",     disabled: true  },
 ] as const;
 
-type GalleryPreviewLoading = "on-demand" | "auto";
 const DEFAULT_HOTKEY = "Ctrl+Shift+2";
 
 function keyFromKeyboardEvent(event: KeyboardEvent) {
@@ -1544,21 +1542,16 @@ function defaultSelectorFocusKey() {
 }
 
 function SettingsPanel({
-  previewLoading,
-  onPreviewLoadingChange,
   hotkey,
   onHotkeyApplied,
   overlayShortcuts,
   onOverlayShortcutsChange,
 }: {
-  previewLoading: GalleryPreviewLoading;
-  onPreviewLoadingChange: (value: GalleryPreviewLoading) => void;
   hotkey: string;
   onHotkeyApplied: (value: string) => void;
   overlayShortcuts: OverlayShortcuts;
   onOverlayShortcutsChange: (next: OverlayShortcuts) => void;
 }) {
-  const [tab, setTab] = useState<"hotkey" | "preferences">("hotkey");
   const [recordingHotkey, setRecordingHotkey] = useState(false);
   const [liveHotkeyTokens, setLiveHotkeyTokens] = useState<string[]>([]);
   const [hotkeyStatus, setHotkeyStatus] = useState("");
@@ -1765,129 +1758,85 @@ function SettingsPanel({
         <span className="text-white/92 font-semibold text-sm tracking-tight">Settings</span>
       </div>
       <div className="flex" style={{ minHeight: 440 }}>
-        <aside className="w-48 shrink-0 border-r border-white/12 p-2 flex flex-col gap-1">
-          {[
-            ["hotkey", "Hotkey"],
-            ["preferences", "Preferences"],
-          ].map(([key, label]) => (
-            <button
-              key={key}
-              onClick={() => setTab(key as "hotkey" | "preferences")}
-              className={[
-                "h-10 px-3 rounded-lg text-left text-xs font-semibold transition-colors",
-                tab === key
-                  ? "bg-white/[0.12] text-white"
-                  : "text-white/58 hover:text-white/90 hover:bg-white/[0.06]",
-              ].join(" ")}
-            >
-              {label}
-            </button>
-          ))}
-        </aside>
         <section className="flex-1 min-w-0 p-4">
-          {tab === "hotkey" ? (
-            <div className="flex flex-col gap-4">
-              <div>
-                <div className="text-white/85 text-xs font-semibold mb-3">Capture shortcut</div>
-                <div className="flex items-center gap-2">
-                  <div className={[
-                    "min-h-10 flex-1 rounded-lg border px-3 py-2 flex flex-wrap items-center gap-1.5",
-                    recordingHotkey ? "border-blue-300/30 bg-blue-400/[0.07]" : "border-white/[0.08] bg-zinc-950/70",
-                  ].join(" ")}>
-                    {visibleHotkeyTokens.length === 0 ? (
-                      <span className="text-white/35 text-xs">Hold keys...</span>
-                    ) : visibleHotkeyTokens.map((token) => (
-                      <kbd
-                        key={token}
-                        className="px-2 py-1 rounded-md bg-white/[0.10] border border-white/[0.10] text-white/82 text-xs font-mono"
-                      >
-                        {token}
-                      </kbd>
-                    ))}
-                  </div>
-                  <button
-                    onClick={startHotkeyEdit}
-                    disabled={recordingHotkey}
-                    className="h-10 px-3 rounded-lg border border-white/[0.10] bg-zinc-900/80 hover:bg-zinc-800/95 text-white/86 text-xs font-semibold transition-colors disabled:opacity-60"
-                  >
-                    Edit
-                  </button>
-                </div>
-                <div className="mt-2 min-h-4 text-[11px] text-white/48">
-                  {recordingHotkey
-                    ? "Hold exactly 3 keys. The shortcut applies automatically."
-                    : hotkeyStatus}
-                </div>
-              </div>
-
-              <div className="border-t border-white/[0.07] pt-4">
-                <div className="flex items-center justify-between mb-3">
-                  <div className="text-white/85 text-xs font-semibold">In-overlay shortcuts</div>
-                </div>
-                <div className="flex flex-col gap-1.5">
-                  {(["area", "fullscreen", "gallery", "settings"] as const).map((action) => {
-                    const recording = recordingOverlayAction === action;
-                    return (
-                      <div
-                        key={action}
-                        className={[
-                          "h-10 flex items-center gap-3 px-3 rounded-lg border transition-colors",
-                          recording ? "border-blue-300/30 bg-blue-400/[0.07]" : "border-white/[0.08] bg-zinc-950/70",
-                        ].join(" ")}
-                      >
-                        <span className="flex-1 text-white/82 text-xs">{OVERLAY_ACTION_LABELS[action]}</span>
-                        <kbd className="px-2 py-1 rounded-md bg-white/[0.08] border border-white/[0.12] text-white/85 text-xs font-mono min-w-7 text-center">
-                          {recording ? "…" : overlayShortcuts[action].toUpperCase()}
-                        </kbd>
-                        <button
-                          onClick={() => {
-                            if (recording) {
-                              setRecordingOverlayAction(null);
-                              setOverlayShortcutError("");
-                            } else {
-                              startOverlayShortcutEdit(action);
-                            }
-                          }}
-                          disabled={!!recordingOverlayAction && !recording}
-                          className="h-7 px-2.5 rounded-md border border-white/[0.10] bg-zinc-900/80 hover:bg-zinc-800/95 text-white/82 text-[11px] font-semibold transition-colors disabled:opacity-50"
-                        >
-                          {recording ? "Cancel" : "Edit"}
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-                <div className="mt-2 min-h-4 text-[11px] text-white/48">
-                  {recordingOverlayAction
-                    ? overlayShortcutError || "Tekan huruf / angka. Esc batal."
-                    : overlayShortcutError}
-                </div>
-              </div>
-            </div>
-          ) : (
+          <div className="flex flex-col gap-4">
             <div>
-              <div className="text-white/85 text-xs font-semibold mb-3">Gallery previews</div>
-              <div className="inline-flex rounded-lg border border-white/[0.08] bg-zinc-950/70 p-1">
-                {[
-                  ["on-demand", "On demand"],
-                  ["auto", "Automatically"],
-                ].map(([value, label]) => (
-                  <button
-                    key={value}
-                    onClick={() => onPreviewLoadingChange(value as GalleryPreviewLoading)}
-                    className={[
-                      "h-9 px-3 rounded-lg text-xs font-semibold transition-colors",
-                      previewLoading === value
-                        ? "bg-white/[0.14] text-white"
-                        : "text-white/58 hover:text-white/90 hover:bg-white/[0.06]",
-                    ].join(" ")}
-                  >
-                    {label}
-                  </button>
-                ))}
+              <div className="text-white/85 text-xs font-semibold mb-3">Capture shortcut</div>
+              <div className="flex items-center gap-2">
+                <div className={[
+                  "min-h-10 flex-1 rounded-lg border px-3 py-2 flex flex-wrap items-center gap-1.5",
+                  recordingHotkey ? "border-blue-300/30 bg-blue-400/[0.07]" : "border-white/[0.08] bg-zinc-950/70",
+                ].join(" ")}>
+                  {visibleHotkeyTokens.length === 0 ? (
+                    <span className="text-white/35 text-xs">Hold keys...</span>
+                  ) : visibleHotkeyTokens.map((token) => (
+                    <kbd
+                      key={token}
+                      className="px-2 py-1 rounded-md bg-white/[0.10] border border-white/[0.10] text-white/82 text-xs font-mono"
+                    >
+                      {token}
+                    </kbd>
+                  ))}
+                </div>
+                <button
+                  onClick={startHotkeyEdit}
+                  disabled={recordingHotkey}
+                  className="h-10 px-3 rounded-lg border border-white/[0.10] bg-zinc-900/80 hover:bg-zinc-800/95 text-white/86 text-xs font-semibold transition-colors disabled:opacity-60"
+                >
+                  Edit
+                </button>
+              </div>
+              <div className="mt-2 min-h-4 text-[11px] text-white/48">
+                {recordingHotkey
+                  ? "Hold exactly 3 keys. The shortcut applies automatically."
+                  : hotkeyStatus}
               </div>
             </div>
-          )}
+
+            <div className="border-t border-white/[0.07] pt-4">
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-white/85 text-xs font-semibold">In-overlay shortcuts</div>
+              </div>
+              <div className="flex flex-col gap-1.5">
+                {(["area", "fullscreen", "gallery", "settings"] as const).map((action) => {
+                  const recording = recordingOverlayAction === action;
+                  return (
+                    <div
+                      key={action}
+                      className={[
+                        "h-10 flex items-center gap-3 px-3 rounded-lg border transition-colors",
+                        recording ? "border-blue-300/30 bg-blue-400/[0.07]" : "border-white/[0.08] bg-zinc-950/70",
+                      ].join(" ")}
+                    >
+                      <span className="flex-1 text-white/82 text-xs">{OVERLAY_ACTION_LABELS[action]}</span>
+                      <kbd className="px-2 py-1 rounded-md bg-white/[0.08] border border-white/[0.12] text-white/85 text-xs font-mono min-w-7 text-center">
+                        {recording ? "…" : overlayShortcuts[action].toUpperCase()}
+                      </kbd>
+                      <button
+                        onClick={() => {
+                          if (recording) {
+                            setRecordingOverlayAction(null);
+                            setOverlayShortcutError("");
+                          } else {
+                            startOverlayShortcutEdit(action);
+                          }
+                        }}
+                        disabled={!!recordingOverlayAction && !recording}
+                        className="h-7 px-2.5 rounded-md border border-white/[0.10] bg-zinc-900/80 hover:bg-zinc-800/95 text-white/82 text-[11px] font-semibold transition-colors disabled:opacity-50"
+                      >
+                        {recording ? "Cancel" : "Edit"}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="mt-2 min-h-4 text-[11px] text-white/48">
+                {recordingOverlayAction
+                  ? overlayShortcutError || "Tekan huruf / angka. Esc batal."
+                  : overlayShortcutError}
+              </div>
+            </div>
+          </div>
         </section>
       </div>
     </div>
@@ -1914,9 +1863,6 @@ function ModeSelector({
   // Default focus is the first non-disabled mode.
   const [focusedKey, setFocusedKey] = useState<string>(() => defaultSelectorFocusKey());
   const [showKeyboardFocus, setShowKeyboardFocus] = useState(false);
-  const [previewLoading, setPreviewLoading] = useState<GalleryPreviewLoading>(() => {
-    return window.localStorage.getItem(GALLERY_PREVIEW_LOADING_KEY) === "auto" ? "auto" : "on-demand";
-  });
   const [hotkey, setHotkey] = useState(DEFAULT_HOTKEY);
 
   // If the user closes the overlay while viewing, clear the viewer so the
@@ -1972,11 +1918,6 @@ function ModeSelector({
 
   const handleCloseViewer = useCallback(() => {
     setViewingItem(null);
-  }, []);
-
-  const handlePreviewLoadingChange = useCallback((value: GalleryPreviewLoading) => {
-    setPreviewLoading(value);
-    window.localStorage.setItem(GALLERY_PREVIEW_LOADING_KEY, value);
   }, []);
 
   // Keyboard navigation for the main menu. Layout:
@@ -2232,8 +2173,6 @@ function ModeSelector({
                 </button>
               </div>
               <SettingsPanel
-                previewLoading={previewLoading}
-                onPreviewLoadingChange={handlePreviewLoadingChange}
                 hotkey={hotkey}
                 onHotkeyApplied={setHotkey}
                 overlayShortcuts={shortcuts}

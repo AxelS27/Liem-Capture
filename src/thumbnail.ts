@@ -149,12 +149,21 @@ let startPoint: Point | null = null;
 let lastPoint: Point | null = null;
 let hoverPoint: ReturnType<typeof eventToCanvasPoint> | null = null;
 let strokePoints: Point[] = [];
-let snapshotBeforeAction = "";
+let snapshotBeforeAction: HTMLCanvasElement | null = null;
 let baseCanvas = document.createElement("canvas");
 let editLayer = document.createElement("canvas");
+// Transient overlay for the in-progress stroke. Previously every
+// pointermove did putImageData(editLayer) to "restore" then re-drew the
+// growing stroke path on editLayer. On a 1080p+ canvas that's 20-50ms
+// per frame and 1000Hz pointermoves snowballed into a queued backlog
+// that locked the main thread. Drawing the live stroke on a separate
+// canvas instead lets each frame just clear+redraw the stroke (cheap
+// line draws, no full-canvas pixel copies). On pointerup we drawImage
+// the strokeLayer onto editLayer to persist it.
+let strokeLayer = document.createElement("canvas");
+let strokeLayerDirty = false;
 let shapeObjects: ShapeObject[] = [];
 let previewShape: ShapeObject | null = null;
-let layerBeforeAction: ImageData | null = null;
 let cropRect: CropRect | null = null;
 let cropInteraction: {
   id: number;
@@ -162,8 +171,20 @@ let cropInteraction: {
   startPoint: Point;
   startRect: CropRect;
 } | null = null;
-let undoStack: string[] = [];
-let redoStack: string[] = [];
+// Undo / redo history holds raw canvas clones, not encoded PNG strings.
+// `editCanvas.toDataURL("image/png")` was being called synchronously on
+// every pointerdown via captureSnapshot(); on a 4K shot that blocked the
+// main thread for 200-500ms and was the actual cause of the "ngeframe
+// dulu" stall after Save — the in-flight save's async PNG encode raced
+// with the new stroke's sync encode and the main thread froze.
+// drawImage between canvases is essentially a GPU blit (<1ms).
+let undoStack: HTMLCanvasElement[] = [];
+let redoStack: HTMLCanvasElement[] = [];
+// Hard cap so an aggressive editor session can't balloon memory. Each
+// 4K snapshot is ~33MB of pixel data; keeping the last 30 still tops out
+// around 1GB worst case, which is more than enough headroom for typical
+// edits.
+const MAX_UNDO_HISTORY = 30;
 const initialColorPrefs = loadColorPrefs();
 let savedColors = initialColorPrefs.colors;
 let editingColorIndex = initialColorPrefs.index;
@@ -582,29 +603,32 @@ function updateHistoryButtons() {
   clearButton.disabled = undoStack.length <= 1;
 }
 
-function captureSnapshot() {
-  return editCanvas.toDataURL("image/png");
+function captureSnapshot(): HTMLCanvasElement {
+  // Cheap canvas-to-canvas blit. drawImage on a fresh canvas is GPU /
+  // memcpy, no PNG encoding.
+  const snap = document.createElement("canvas");
+  snap.width = editCanvas.width;
+  snap.height = editCanvas.height;
+  const ctx = snap.getContext("2d");
+  if (ctx) ctx.drawImage(editCanvas, 0, 0);
+  return snap;
 }
 
-function drawSnapshot(dataUrl: string) {
-  const img = new Image();
-  img.onload = () => {
-    baseCanvas.width = img.naturalWidth || img.width;
-    baseCanvas.height = img.naturalHeight || img.height;
-    editLayer.width = baseCanvas.width;
-    editLayer.height = baseCanvas.height;
-    editCanvas.width = baseCanvas.width;
-    editCanvas.height = baseCanvas.height;
-    baseCanvas.getContext("2d")?.drawImage(img, 0, 0);
-    editLayer.getContext("2d")?.clearRect(0, 0, editLayer.width, editLayer.height);
-    shapeObjects = [];
-    previewShape = null;
-    cropInteraction = null;
-    setCropRect(null);
-    resetCameraView();
-    renderComposite();
-  };
-  img.src = dataUrl;
+function drawSnapshot(snap: HTMLCanvasElement) {
+  baseCanvas.width = snap.width;
+  baseCanvas.height = snap.height;
+  editLayer.width = baseCanvas.width;
+  editLayer.height = baseCanvas.height;
+  editCanvas.width = baseCanvas.width;
+  editCanvas.height = baseCanvas.height;
+  baseCanvas.getContext("2d")?.drawImage(snap, 0, 0);
+  editLayer.getContext("2d")?.clearRect(0, 0, editLayer.width, editLayer.height);
+  shapeObjects = [];
+  previewShape = null;
+  cropInteraction = null;
+  setCropRect(null);
+  resetCameraView();
+  renderComposite();
 }
 
 function canvasFromDataUrl(dataUrl: string) {
@@ -779,11 +803,36 @@ function layerContext() {
   return ctx;
 }
 
+function syncStrokeLayerSize() {
+  if (strokeLayer.width !== editCanvas.width || strokeLayer.height !== editCanvas.height) {
+    strokeLayer.width = editCanvas.width;
+    strokeLayer.height = editCanvas.height;
+    strokeLayerDirty = false;
+  }
+}
+
+function strokeLayerContext() {
+  syncStrokeLayerSize();
+  const ctx = strokeLayer.getContext("2d");
+  if (!ctx) throw new Error("Stroke layer unavailable");
+  return ctx;
+}
+
+function clearStrokeLayer() {
+  if (!strokeLayerDirty) return;
+  syncStrokeLayerSize();
+  strokeLayer.getContext("2d")?.clearRect(0, 0, strokeLayer.width, strokeLayer.height);
+  strokeLayerDirty = false;
+}
+
 function renderComposite() {
   const ctx = canvasContext();
   ctx.clearRect(0, 0, editCanvas.width, editCanvas.height);
   ctx.drawImage(baseCanvas, 0, 0);
   ctx.drawImage(editLayer, 0, 0);
+  if (strokeLayerDirty) {
+    ctx.drawImage(strokeLayer, 0, 0);
+  }
   for (const shape of shapeObjects) {
     drawShapeObject(ctx, shape);
   }
@@ -804,21 +853,15 @@ function flattenShapeObjectsIntoLayer() {
   renderComposite();
 }
 
-function captureLayer() {
-  return layerContext().getImageData(0, 0, editLayer.width, editLayer.height);
-}
-
-function restoreLayer() {
-  if (!layerBeforeAction) return;
-  layerContext().putImageData(layerBeforeAction, 0, 0);
-  renderComposite();
-}
-
-function commitSnapshot(before: string) {
-  const after = captureSnapshot();
-  if (after === before) return;
-
-  undoStack.push(after);
+function commitSnapshot(_before: HTMLCanvasElement | null) {
+  // We can no longer dedupe by equality the way the old string-based
+  // snapshots did — comparing two canvases pixel-by-pixel would be just
+  // as expensive as the encode we were trying to skip. Always push; if
+  // the user did nothing they can hit Undo to wipe the redundant entry.
+  undoStack.push(captureSnapshot());
+  if (undoStack.length > MAX_UNDO_HISTORY) {
+    undoStack.splice(0, undoStack.length - MAX_UNDO_HISTORY);
+  }
   redoStack = [];
   updateHistoryButtons();
 }
@@ -1462,31 +1505,68 @@ function handlePointerCancel(event: PointerEvent) {
   resumeTimer();
 }
 
-function drawStroke(points: Point[]) {
-  if (points.length < 2) return;
-
-  const ctx = layerContext();
-  ctx.save();
-  ctx.lineCap = "round";
-  ctx.lineJoin = "round";
-  ctx.lineWidth = visualSizeToCanvasSize(drawTool === "eraser" ? eraserSize() : currentSize());
-
-  if (drawTool === "eraser") {
-    ctx.globalCompositeOperation = "destination-out";
-    ctx.strokeStyle = "rgba(0,0,0,1)";
-  } else {
-    ctx.globalCompositeOperation = "source-over";
-    ctx.strokeStyle = colorInput.value;
-    ctx.globalAlpha = drawTool === "highlighter" ? 0.34 : 1;
-  }
-
+function strokePath(ctx: CanvasRenderingContext2D, points: Point[]) {
   ctx.beginPath();
   ctx.moveTo(points[0].x, points[0].y);
   for (const point of points.slice(1)) {
     ctx.lineTo(point.x, point.y);
   }
   ctx.stroke();
+}
+
+// Live stroke preview. Renders onto the transient strokeLayer so we don't
+// have to putImageData(editLayer) every frame. The eraser still gets a
+// preview (rendered semi-transparent) and is committed via
+// destination-out on pointerup so the user sees what they'll erase.
+function renderStrokePreview(points: Point[]) {
+  syncStrokeLayerSize();
+  const ctx = strokeLayerContext();
+  ctx.clearRect(0, 0, strokeLayer.width, strokeLayer.height);
+  strokeLayerDirty = false;
+
+  if (points.length < 2) return;
+
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  if (drawTool === "eraser") {
+    ctx.lineWidth = visualSizeToCanvasSize(eraserSize());
+    ctx.strokeStyle = "rgba(255,255,255,0.6)";
+    ctx.globalAlpha = 0.6;
+  } else {
+    ctx.lineWidth = visualSizeToCanvasSize(currentSize());
+    ctx.strokeStyle = colorInput.value;
+    ctx.globalAlpha = drawTool === "highlighter" ? 0.34 : 1;
+  }
+
+  strokePath(ctx, points);
   ctx.restore();
+  strokeLayerDirty = true;
+}
+
+// Apply the just-drawn stroke directly to editLayer on pointerup so it
+// becomes part of the persistent state. For pencil / highlighter we just
+// drawImage the strokeLayer over the editLayer. For eraser we re-run the
+// path as a destination-out so it actually subtracts pixels.
+function commitStrokeLayer(points: Point[]) {
+  if (drawTool === "eraser") {
+    if (points.length >= 2) {
+      const ctx = layerContext();
+      ctx.save();
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.lineWidth = visualSizeToCanvasSize(eraserSize());
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.strokeStyle = "rgba(0,0,0,1)";
+      strokePath(ctx, points);
+      ctx.restore();
+    }
+  } else if (strokeLayerDirty) {
+    const ctx = layerContext();
+    ctx.drawImage(strokeLayer, 0, 0);
+  }
+  clearStrokeLayer();
 }
 
 function drawShapePreview(start: Point, end: Point) {
@@ -1525,7 +1605,7 @@ function applyCropRect(rect: CropRect) {
   return true;
 }
 
-function replaceCanvasWith(next: HTMLCanvasElement, before: string, keepCropMode = false) {
+function replaceCanvasWith(next: HTMLCanvasElement, before: HTMLCanvasElement, keepCropMode = false) {
   baseCanvas.width = next.width;
   baseCanvas.height = next.height;
   editLayer.width = next.width;
@@ -1873,8 +1953,11 @@ editCanvas.addEventListener("pointerdown", (event) => {
   snapshotBeforeAction = captureSnapshot();
   if (mode === "draw") {
     flattenShapeObjectsIntoLayer();
+    // strokeLayer holds the in-progress live preview only. Start from a
+    // clean slate every pointerdown so the previous (now committed)
+    // stroke doesn't ghost-double under the new one.
+    clearStrokeLayer();
   }
-  layerBeforeAction = captureLayer();
   editCanvas.setPointerCapture(event.pointerId);
 });
 
@@ -1943,6 +2026,27 @@ editCanvas.addEventListener("pointerleave", () => {
   updateEraserCursor();
 });
 
+// rAF-coalesce the in-progress drawing render. Pointermove can fire at
+// 1000Hz on modern mice; without batching we'd schedule a full canvas
+// composite per event and back up dozens of frames behind a single render
+// tick. Drawing is the hot path the user feels most — keep it lean.
+let pendingStrokeRaf = 0;
+function scheduleStrokeRender() {
+  if (pendingStrokeRaf) return;
+  pendingStrokeRaf = window.requestAnimationFrame(() => {
+    pendingStrokeRaf = 0;
+    if (!drawing || !startPoint || !lastPoint) return;
+    if (mode === "draw") {
+      renderStrokePreview(strokePoints);
+      renderComposite();
+    } else if (mode === "shape") {
+      drawShapePreview(startPoint, lastPoint);
+    } else if (mode === "crop") {
+      renderCropBox();
+    }
+  });
+}
+
 editCanvas.addEventListener("pointermove", (event) => {
   if (!isPreviewMode || !isEditorReady) return;
 
@@ -1964,14 +2068,13 @@ editCanvas.addEventListener("pointermove", (event) => {
 
   if (mode === "draw") {
     strokePoints.push(point);
-    restoreLayer();
-    drawStroke(strokePoints);
-    renderComposite();
     lastPoint = point;
+    scheduleStrokeRender();
   } else if (mode === "shape") {
-    drawShapePreview(startPoint, point);
+    lastPoint = point;
+    scheduleStrokeRender();
   } else if (mode === "crop") {
-    renderCropBox();
+    scheduleStrokeRender();
   }
 });
 
@@ -1995,7 +2098,21 @@ editCanvas.addEventListener("pointerup", (event) => {
     editCanvas.releasePointerCapture(event.pointerId);
   }
 
+  // Cancel any pending stroke render — we're about to flatten and the
+  // next tick's repaint would otherwise still try to draw the live
+  // preview on top of the committed pixels.
+  if (pendingStrokeRaf) {
+    window.cancelAnimationFrame(pendingStrokeRaf);
+    pendingStrokeRaf = 0;
+  }
+
   if (mode === "draw") {
+    // Flush any moves that hadn't rendered yet, then bake the stroke
+    // into editLayer and clear the transient preview.
+    strokePoints.push(end);
+    renderStrokePreview(strokePoints);
+    commitStrokeLayer(strokePoints);
+    renderComposite();
     commitSnapshot(snapshotBeforeAction);
   } else if (mode === "shape") {
     const shape = shapeFromPoints(shapeTool, startPoint, end);
@@ -2012,7 +2129,6 @@ editCanvas.addEventListener("pointerup", (event) => {
   startPoint = null;
   lastPoint = null;
   strokePoints = [];
-  layerBeforeAction = null;
 });
 
 editCanvas.addEventListener("pointercancel", (event) => {
@@ -2031,6 +2147,10 @@ editCanvas.addEventListener("pointercancel", (event) => {
   startPoint = null;
   lastPoint = null;
   strokePoints = [];
+  if (pendingStrokeRaf) {
+    window.cancelAnimationFrame(pendingStrokeRaf);
+    pendingStrokeRaf = 0;
+  }
   updateEraserCursor();
   if (editCanvas.hasPointerCapture(event.pointerId)) {
     editCanvas.releasePointerCapture(event.pointerId);
@@ -2038,10 +2158,11 @@ editCanvas.addEventListener("pointercancel", (event) => {
   if (wasCropMode) {
     renderCropBox();
   } else {
-    cropBox.style.display = "none";
-    restoreLayer();
+    // Drop the in-progress preview — the stroke was aborted so nothing
+    // gets committed to editLayer.
+    clearStrokeLayer();
+    renderComposite();
   }
-  layerBeforeAction = null;
 });
 
 editCanvas.addEventListener("dragover", (event) => {
@@ -2271,7 +2392,6 @@ clearButton.addEventListener("click", () => {
 // most recent destination is the default.
 const LAST_GALLERY_FOLDER_KEY = "liem-capture:last-gallery-folder";
 const LAST_SAVE_AS_DIR_KEY = "liem-capture:last-save-as-dir";
-const GALLERY_PREVIEW_LOADING_KEY = "liem-capture:gallery-preview-loading";
 const saveMenu = document.querySelector<HTMLDivElement>("#save-menu")!;
 
 interface SaveFolderNode {
@@ -2340,16 +2460,16 @@ let pickerSelectedPath: string = ""; // "" = gallery root
 let pickerExpandedFolders: Set<string> = new Set();
 let pickerSelectedItem: string | null = null;
 let pickerKeyboardArea: "tree" | "grid" = "tree";
-let pickerFilesVisiblePath: string | null = null;
-let pickerVisibleItemCount = 0;
-let pickerPromptRequestId = 0;
+// Monotonic generation counter — bumped on every renderPickerGrid call so an
+// in-flight lazy-load loop can detect it's stale (user switched folders /
+// closed the picker) and bail without overwriting newer state.
+let pickerGridGeneration = 0;
 const pickerPreviewCache: Map<string, string> = new Map();
 const pickerMetadataCache: Map<string, GalleryMetadata> = new Map();
-const PICKER_ITEM_CHUNK_SIZE = 12;
-
-function shouldAutoLoadPickerFiles() {
-  return window.localStorage.getItem(GALLERY_PREVIEW_LOADING_KEY) === "auto";
-}
+// Delay between sequential preview fetches in the save picker. Keeps the
+// frame-paint loop free so opening a busy folder doesn't visibly lag the
+// editor UI behind it.
+const PICKER_PREVIEW_STAGGER_MS = 28;
 
 interface PickerItem { path: string; name: string }
 interface GalleryMetadata {
@@ -2609,45 +2729,13 @@ function togglePickerExpand(path: string) {
   renderPickerTree();
 }
 
-async function renderPickerBrowsePrompt() {
-  const requestId = ++pickerPromptRequestId;
-  const folder = pickerSelectedPath;
-  pickerGridEl.classList.add("is-prompt");
-  pickerGridEl.innerHTML = `<div class="picker-empty"><div class="picker-empty-text">Checking folder...</div></div>`;
-
-  try {
-    const items = await invoke<PickerItem[]>("list_gallery_items", {
-      folder: folder === "" ? null : folder,
-    });
-    if (requestId !== pickerPromptRequestId || folder !== pickerSelectedPath) return;
-
-    if (items.length === 0) {
-      pickerGridEl.innerHTML = `<div class="picker-empty"><div class="picker-empty-text">This folder is empty.</div></div>`;
-      return;
-    }
-
-    pickerGridEl.innerHTML = `
-      <div class="picker-empty">
-        <div class="picker-empty-text">${items.length} item${items.length === 1 ? "" : "s"} in this folder.</div>
-        <button class="picker-inline-btn" data-picker-grid-action="show-files">Show files</button>
-      </div>`;
-  } catch (error) {
-    console.error(error);
-    if (requestId !== pickerPromptRequestId || folder !== pickerSelectedPath) return;
-    pickerGridEl.innerHTML = `<div class="picker-empty"><div class="picker-empty-text">Could not check folder.</div></div>`;
-  }
-}
-
 function refreshPickerGridView() {
-  if (pickerFilesVisiblePath === pickerSelectedPath) void renderPickerGrid();
-  else void renderPickerBrowsePrompt();
+  void renderPickerGrid();
 }
 
 function selectPickerFolder(path: string) {
   pickerSelectedPath = path;
   pickerSelectedItem = null;
-  pickerFilesVisiblePath = shouldAutoLoadPickerFiles() ? pickerSelectedPath : null;
-  pickerVisibleItemCount = PICKER_ITEM_CHUNK_SIZE;
   renderPickerTree();
   renderPickerInfo();
   updatePickerCurrentLabel();
@@ -2726,16 +2814,22 @@ pickerTreeEl.addEventListener("click", (event) => {
 });
 
 async function renderPickerGrid() {
-  pickerPromptRequestId += 1;
+  // Snapshot the generation + folder we were called with. If the user
+  // switches folders or closes the picker mid-load, every async step below
+  // checks these and bails so it can't overwrite the fresher view.
+  const generation = ++pickerGridGeneration;
+  const folder = pickerSelectedPath;
+
   pickerGridEl.classList.remove("is-prompt");
   pickerGridEl.innerHTML = `<div class="picker-empty">Loading…</div>`;
   let items: PickerItem[] = [];
   try {
     items = await invoke<PickerItem[]>("list_gallery_items", {
-      folder: pickerSelectedPath === "" ? null : pickerSelectedPath,
+      folder: folder === "" ? null : folder,
     });
   } catch (error) {
     console.error(error);
+    if (generation !== pickerGridGeneration) return;
     pickerGridEl.innerHTML = `<div class="picker-empty">Could not list folder</div>`;
     if (pickerSelectedItem) {
       pickerSelectedItem = null;
@@ -2743,6 +2837,8 @@ async function renderPickerGrid() {
     }
     return;
   }
+  if (generation !== pickerGridGeneration) return;
+
   // Clear stale selection if the previously-selected file is no longer
   // in the visible folder.
   if (pickerSelectedItem && !items.some((it) => it.path === pickerSelectedItem)) {
@@ -2753,38 +2849,47 @@ async function renderPickerGrid() {
     pickerGridEl.innerHTML = `<div class="picker-empty">Folder is empty</div>`;
     return;
   }
-  if (pickerVisibleItemCount <= 0) pickerVisibleItemCount = PICKER_ITEM_CHUNK_SIZE;
-  const visibleItems = items.slice(0, pickerVisibleItemCount);
-  const hasMore = pickerVisibleItemCount < items.length;
 
-  // Render one chunk first; preview decoding is intentionally limited to
-  // visible tiles so opening a busy folder stays responsive.
-  pickerGridEl.innerHTML = visibleItems
+  // Render every tile as an empty placeholder right away. The grid layout
+  // is final before any preview comes in, so the editor underneath never
+  // sees a jank-y reflow. Previews then drop in one-by-one below.
+  pickerGridEl.innerHTML = items
     .map((it) => {
       const selected = pickerSelectedItem === it.path ? " selected" : "";
       return `<div class="picker-tile${selected}" data-preview-path="${escapeHtml(it.path)}" title="${escapeHtml(it.name)}"></div>`;
     })
-    .join("") + (hasMore
-      ? `<button class="picker-load-more" data-picker-grid-action="load-more">Show more</button>`
-      : "");
+    .join("");
 
-  for (const it of visibleItems) {
+  // Sequential lazy load. Previously every visible tile fired its preview
+  // request in parallel, which hammered Rust with N decodes the moment the
+  // picker opened — that's the "jetlag" feel the user described. Stagger
+  // each fetch by PICKER_PREVIEW_STAGGER_MS so the UI thread + IPC channel
+  // stay breathing.
+  for (const it of items) {
+    if (generation !== pickerGridGeneration) return;
     const tile = pickerGridEl.querySelector<HTMLElement>(
       `[data-preview-path="${CSS.escape(it.path)}"]`,
     );
     if (!tile) continue;
-    if (pickerPreviewCache.has(it.path)) {
-      tile.innerHTML = `<img src="data:image/png;base64,${pickerPreviewCache.get(it.path)}" draggable="false" />`;
+
+    const cached = pickerPreviewCache.get(it.path);
+    if (cached !== undefined) {
+      tile.innerHTML = `<img src="data:image/png;base64,${cached}" draggable="false" />`;
       continue;
     }
-    invoke<string>("get_gallery_preview", { path: it.path })
-      .then((b64) => {
-        pickerPreviewCache.set(it.path, b64);
-        if (tile.isConnected) {
-          tile.innerHTML = `<img src="data:image/png;base64,${b64}" draggable="false" />`;
-        }
-      })
-      .catch(console.error);
+
+    try {
+      const b64 = await invoke<string>("get_gallery_preview", { path: it.path });
+      if (generation !== pickerGridGeneration) return;
+      pickerPreviewCache.set(it.path, b64);
+      if (tile.isConnected) {
+        tile.innerHTML = `<img src="data:image/png;base64,${b64}" draggable="false" />`;
+      }
+    } catch (err) {
+      console.error(err);
+    }
+
+    await new Promise((resolve) => window.setTimeout(resolve, PICKER_PREVIEW_STAGGER_MS));
   }
 }
 
@@ -2929,19 +3034,6 @@ async function deletePickerItem(path: string) {
 // Click on a tile in the grid → select for info viewing.
 pickerGridEl.addEventListener("click", (event) => {
   pickerKeyboardArea = "grid";
-  const action = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-picker-grid-action]");
-  if (action?.dataset.pickerGridAction === "show-files") {
-    pickerFilesVisiblePath = pickerSelectedPath;
-    pickerVisibleItemCount = PICKER_ITEM_CHUNK_SIZE;
-    void renderPickerGrid();
-    return;
-  }
-  if (action?.dataset.pickerGridAction === "load-more") {
-    pickerVisibleItemCount += PICKER_ITEM_CHUNK_SIZE;
-    void renderPickerGrid();
-    return;
-  }
-
   const tile = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-preview-path]");
   if (!tile) return;
   const path = tile.dataset.previewPath ?? "";
@@ -2979,7 +3071,7 @@ window.addEventListener("keydown", (event) => {
     event.preventDefault();
     event.stopPropagation();
 
-    if (pickerKeyboardArea === "grid" && pickerFilesVisiblePath === pickerSelectedPath && visiblePickerTiles().length > 0) {
+    if (pickerKeyboardArea === "grid" && visiblePickerTiles().length > 0) {
       const delta =
         event.key === "ArrowLeft" ? -1 :
         event.key === "ArrowRight" ? 1 :
@@ -3078,15 +3170,37 @@ async function openSavePicker() {
     console.error(error);
     pickerTree = null;
   }
-  // Default selection: last-used folder, or current file's folder if
-  // we've never saved before, falling back to root.
-  const remembered = localStorage.getItem(LAST_GALLERY_FOLDER_KEY);
-  if (remembered !== null && findPickerFolder(pickerTree, remembered)) {
-    pickerSelectedPath = remembered;
+  // Default selection: if this file is ALREADY in the gallery, anchor the
+  // picker to its current folder so an absent-minded "Save" overwrites in
+  // place instead of moving the file to some unrelated last-used folder.
+  // The remembered folder is reserved for fresh screenshots (still living
+  // in the temp capture dir) where we genuinely don't know where to put
+  // them yet.
+  //
+  // Without this guard the previous logic preferred LAST_GALLERY_FOLDER_KEY
+  // unconditionally, so a re-edit + Save would silently relocate the file
+  // to wherever the user last saved something else — and the original copy
+  // got deleted because Rust treats "saved to a different path" as a move.
+  const galleryRootPath = pickerTree?.path ?? "";
+  const currentFolder = fileFolder(filePath);
+  const inGallery = !!galleryRootPath
+    && (currentFolder === galleryRootPath
+      || currentFolder.startsWith(galleryRootPath + "\\")
+      || currentFolder.startsWith(galleryRootPath + "/"));
+
+  if (inGallery) {
+    if (currentFolder === galleryRootPath) {
+      pickerSelectedPath = ""; // root sentinel
+    } else if (findPickerFolder(pickerTree, currentFolder)) {
+      pickerSelectedPath = currentFolder;
+    } else {
+      pickerSelectedPath = "";
+    }
   } else {
-    const galleryRootGuess = pickerTree?.path ?? "";
-    const cur = fileFolder(filePath);
-    pickerSelectedPath = cur && cur !== galleryRootGuess && findPickerFolder(pickerTree, cur) ? cur : "";
+    const remembered = localStorage.getItem(LAST_GALLERY_FOLDER_KEY);
+    pickerSelectedPath = remembered !== null && findPickerFolder(pickerTree, remembered)
+      ? remembered
+      : "";
   }
   // Root defaults to expanded the first time the user opens the picker.
   // After that we respect whatever expansion state they left it in.
@@ -3102,8 +3216,6 @@ async function openSavePicker() {
     autoExpandAncestors(pickerTree.path, pickerSelectedPath);
   }
   pickerSelectedItem = null;
-  pickerFilesVisiblePath = shouldAutoLoadPickerFiles() ? pickerSelectedPath : null;
-  pickerVisibleItemCount = PICKER_ITEM_CHUNK_SIZE;
   // Pre-fill the filename input with the current file's name (without
   // the .png extension — that's added as a static suffix in the UI).
   const baseName = fileBaseName(filePath);
@@ -3166,45 +3278,100 @@ window.addEventListener("keydown", (event) => {
   }
 }, true);
 
+// PNG-encode the editor canvas without freezing the main thread.
+// `toDataURL` does a synchronous encode that can take 200-500ms on a 4K
+// canvas, which is exactly the "ngeframe dulu" lag the user reported when
+// saving. `toBlob` hands the encode to a worker; we then read the bytes as
+// a data URL via FileReader (also off-thread). Main-thread cost drops to
+// nearly zero.
+function canvasToPngDataUrl(canvas: HTMLCanvasElement): Promise<string> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        reject(new Error("Canvas encode failed"));
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = () => reject(reader.error ?? new Error("Read failed"));
+      reader.readAsDataURL(blob);
+    }, "image/png");
+  });
+}
+
+// Tracks an in-flight save so a double-click on the menu can't spawn
+// two concurrent invokes (each would auto-version because hasEdits=true,
+// littering the gallery with phantom duplicates).
+let saveInFlight = false;
+
 async function saveToFolder(folderPath: string, destName: string | null = null) {
+  if (saveInFlight) return;
   if (!filePath || !isPreviewMode || !isEditorReady) return;
-  saveButton.disabled = true;
+  saveInFlight = true;
   saveButton.classList.add("active");
-  try {
-    const dataUrl = editCanvas.toDataURL("image/png");
-    const hasEdits = undoStack.length > 1;
-    const data = await invoke<ThumbnailData>("save_edited_thumbnail", {
-      label: currentWindow.label,
-      path: filePath,
-      dataUrl,
-      destFolder: folderPath === "" ? null : folderPath,
-      destName,
-      hasEdits,
-    });
-    // Rust may have moved the file to a new folder — re-anchor filePath
-    // and the loadedFilePath cache so subsequent edits target the right
-    // location.
-    filePath = data.path;
-    loadedFilePath = data.path;
-    imageDataUrl = `data:image/png;base64,${data.image}`;
-    image.src = imageDataUrl;
-    undoStack = [dataUrl];
-    redoStack = [];
-    updateHistoryButtons();
-    flashStatus("Saved");
-    hasUserSaved = true;
-    localStorage.setItem(LAST_GALLERY_FOLDER_KEY, folderPath);
-  } catch (error) {
-    // Rust returns descriptive strings for the "nothing to save" and
-    // "duplicate exists" guards; surface them in the status pill so the
-    // user knows why the click didn't take.
-    const message = typeof error === "string" ? error : "Save failed";
-    console.error(error);
-    flashStatus(message);
-  } finally {
-    saveButton.disabled = false;
-    saveButton.classList.remove("active");
-  }
+  flashStatus("Saving…");
+
+  // Capture the inputs to the save at the moment the user clicked. If
+  // they kick off another save (or open a different gallery item) while
+  // this one is in flight we want to land THIS file's pixels at THIS
+  // path — not whatever state the editor has drifted to.
+  const hasEdits = undoStack.length > 1;
+  const savingFromPath = filePath;
+
+  // Whole pipeline runs in the background so the editor canvas stays
+  // responsive. Before this, the user reported a freeze right after Save
+  // — the encode + IPC took 300-800ms, and worse, the post-save
+  // `undoStack = [dataUrl]` reset triggered a GC pause when it dropped
+  // multiple multi-megabyte snapshot strings, stalling the next pointer
+  // frame. Now everything heavy is fire-and-forget; the editor is back
+  // in the user's hands immediately.
+  void (async () => {
+    try {
+      const dataUrl = await canvasToPngDataUrl(editCanvas);
+      const data = await invoke<ThumbnailData>("save_edited_thumbnail", {
+        label: currentWindow.label,
+        path: savingFromPath,
+        dataUrl,
+        destFolder: folderPath === "" ? null : folderPath,
+        destName,
+        hasEdits,
+      });
+
+      // Only re-anchor file metadata if the user is still editing the
+      // same file. If they swapped to another gallery item mid-save the
+      // path now points elsewhere and we must not stomp on it.
+      //
+      // We DON'T blow away the undo stack here anymore. The save is a
+      // side effect; the user's edit history stays intact so they can
+      // keep undoing past the save point. The old behaviour of
+      // `undoStack = [dataUrl]` was the main cause of the post-save
+      // freeze the user complained about.
+      //
+      // We also DON'T touch `image.src`. That element backs the small
+      // floating tile, which isn't visible while we're in preview mode.
+      // When the user collapses back to the tile, the existing
+      // `imageDataUrl` value is already current enough — and skipping
+      // the assignment avoids a preview PNG decode in the hot path.
+      if (filePath === savingFromPath) {
+        filePath = data.path;
+        loadedFilePath = data.path;
+        imageDataUrl = `data:image/png;base64,${data.image}`;
+      }
+      flashStatus("Saved");
+      hasUserSaved = true;
+      localStorage.setItem(LAST_GALLERY_FOLDER_KEY, folderPath);
+    } catch (error) {
+      // Rust returns descriptive strings for the "nothing to save" and
+      // "duplicate exists" guards; surface them in the status pill so the
+      // user knows why the click didn't take.
+      const message = typeof error === "string" ? error : "Save failed";
+      console.error(error);
+      flashStatus(message);
+    } finally {
+      saveButton.classList.remove("active");
+      saveInFlight = false;
+    }
+  })();
 }
 
 async function saveAs() {
@@ -3233,7 +3400,7 @@ async function saveAs() {
   saveButton.disabled = true;
   saveButton.classList.add("active");
   try {
-    const dataUrl = editCanvas.toDataURL("image/png");
+    const dataUrl = await canvasToPngDataUrl(editCanvas);
     await invoke("export_png_to_path", { path: chosen, dataUrl });
     flashStatus("Saved");
     const dir = fileFolder(chosen);

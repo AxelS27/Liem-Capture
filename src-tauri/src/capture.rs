@@ -4,10 +4,18 @@ use std::{
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
+use chrono::Local;
 use tauri::{command, AppHandle, Emitter, Manager};
 use xcap::Monitor;
 
 use crate::window;
+
+/// "liemcapture_20260527_143012.png" — sortable in the file picker,
+/// readable at a glance. Uses the user's local clock since that's what
+/// matches what's on screen when they capture.
+fn default_capture_filename() -> String {
+    format!("liemcapture_{}.png", Local::now().format("%Y%m%d_%H%M%S"))
+}
 
 #[derive(Clone, serde::Serialize)]
 pub struct ThumbnailPayload {
@@ -664,25 +672,18 @@ pub fn save_edited_thumbnail(
         };
 
     let candidate = target_folder.join(&target_filename);
+    let src_is_temp = is_temp_capture_path(&app, &src);
 
-    let final_path = if candidate == src {
-        // Same destination — UI gating already prevents redundant saves
-        // for files the user has explicitly saved before; for fresh
-        // screenshots a no-op rewrite is harmless and lets the first
-        // save "just work".
-        candidate
-    } else if candidate.exists() {
-        if !has_edits {
-            return Err("A file with that name already exists in the destination".into());
-        }
-        // Has edits + name conflict → save alongside as a new file.
-        let target_path = Path::new(&target_filename);
-        let stem = target_path
+    // Auto-version helper: foo.png → foo_1.png, foo_2.png … in the target
+    // folder, skipping anything that already exists.
+    let next_versioned = |filename: &std::ffi::OsString| -> PathBuf {
+        let p = Path::new(filename);
+        let stem = p
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("shot")
+            .unwrap_or("liemcapture")
             .to_string();
-        let ext = target_path
+        let ext = p
             .extension()
             .and_then(|s| s.to_str())
             .unwrap_or("png")
@@ -691,19 +692,57 @@ pub fn save_edited_thumbnail(
         loop {
             let attempt = target_folder.join(format!("{stem}_{idx}.{ext}"));
             if !attempt.exists() {
-                break attempt;
+                return attempt;
             }
             idx += 1;
         }
+    };
+
+    // Resolve the final write target.
+    //
+    //   candidate == src
+    //     • src in temp (fresh capture)  → overwrite in place; this is
+    //                                       just "commit this screenshot
+    //                                       to the gallery".
+    //     • src in gallery + no edits     → overwrite (a no-op rewrite —
+    //                                       same bytes, harmless).
+    //     • src in gallery + has edits    → auto-version. The user
+    //                                       expects their original to
+    //                                       survive an edit + save pass,
+    //                                       so we land the edited copy
+    //                                       beside it (foo.png → foo_1.png).
+    //
+    //   candidate != src (different folder / different name)
+    //     • candidate doesn't exist       → write there.
+    //     • candidate exists
+    //         · no edits → block (would clobber an unrelated file).
+    //         · has edits → auto-version.
+    let final_path = if candidate == src {
+        if has_edits && !src_is_temp {
+            next_versioned(&target_filename)
+        } else {
+            candidate
+        }
+    } else if candidate.exists() {
+        if !has_edits {
+            return Err("A file with that name already exists in the destination".into());
+        }
+        next_versioned(&target_filename)
     } else {
         candidate
     };
 
     save_png_compressed(&final_path, &img)?;
-    // If the user picked a different folder, the original file in the
-    // old location is now stale — remove it so we don't leave duplicates
-    // scattered around the gallery.
-    if final_path != src && src.exists() {
+    // Cleanup the source:
+    //   • Temp captures are one-shot — always delete after a successful
+    //     gallery write (otherwise the temp dir leaks).
+    //   • Gallery sources we only delete on a deliberate rename/move
+    //     (different destination, no edits). With edits we just wrote a
+    //     versioned copy, so the original must stay.
+    let should_delete_src = final_path != src
+        && src.exists()
+        && (src_is_temp || !has_edits);
+    if should_delete_src {
         let _ = std::fs::remove_file(&src);
     }
 
@@ -718,7 +757,13 @@ pub fn save_edited_thumbnail(
         .map_err(|e| e.to_string())?
         .insert(label, payload.clone());
 
-    let _ = copy_rgba_to_clipboard(&img);
+    // Defer the clipboard push so we can return to JS immediately. The
+    // arboard `set_image` call on Windows can take 30-100ms on a large
+    // shot; doing it inline made every Save feel like a hitch. The image
+    // is moved into the worker, so no extra clone of the full RGBA buffer.
+    std::thread::spawn(move || {
+        let _ = copy_rgba_to_clipboard(&img);
+    });
     Ok(payload)
 }
 
@@ -765,11 +810,7 @@ pub fn take_screenshot(
 
     let cropped = image::imageops::crop_imm(&full, rel_x, rel_y, crop_w, crop_h).to_image();
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let path = temp_capture_dir(&app).join(format!("shot_{ts}.png"));
+    let path = temp_capture_dir(&app).join(default_capture_filename());
     let path_str = path.to_string_lossy().to_string();
     let idx = window::reserve_thumbnail_index();
     push_thumbnail(&app, path_str.clone(), &cropped, idx);
@@ -788,11 +829,7 @@ pub fn take_fullscreen(app: AppHandle) -> Result<String, String> {
     let monitor = monitors.first().ok_or("No monitor found")?;
     let image = monitor.capture_image().map_err(|e| e.to_string())?;
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let path = temp_capture_dir(&app).join(format!("shot_{ts}.png"));
+    let path = temp_capture_dir(&app).join(default_capture_filename());
     let path_str = path.to_string_lossy().to_string();
     let idx = window::reserve_thumbnail_index();
     push_thumbnail(&app, path_str.clone(), &image, idx);
