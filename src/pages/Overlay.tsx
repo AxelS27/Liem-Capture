@@ -156,6 +156,7 @@ function formatDateTime(ms: number): string {
 
 const ROOT_LABEL = "Liem Capture";
 const DRAG_THRESHOLD_PX = 5;
+const ESC_BACK_COOLDOWN_MS = 140;
 
 // Shared between the inline ImageViewer and the Overlay's global keydown
 // handler. While the viewer is open we want Esc to dismiss only the viewer
@@ -1999,10 +2000,6 @@ export default function Overlay() {
   const rafRef     = useRef<number>(0);
   const modeRef    = useRef<Mode>("select");
   const closeTimerRef = useRef<number | null>(null);
-  // Time (performance.now) before which Esc keydowns are ignored.
-  // Set whenever we successfully back-navigate (selectorBackRef returned
-  // true) so an OS-level second keydown — auto-repeat or a hardware
-  // double-fire — can't accidentally close the overlay.
   const escCloseSuppressedUntilRef = useRef(0);
   const [mode, setMode] = useState<Mode>("select");
   const [overlayClosing, setOverlayClosing] = useState(false);
@@ -2062,7 +2059,7 @@ export default function Overlay() {
     }
 
     if (selectorBackRef.current?.()) {
-      escCloseSuppressedUntilRef.current = performance.now() + 600;
+      escCloseSuppressedUntilRef.current = performance.now() + ESC_BACK_COOLDOWN_MS;
       return;
     }
 
@@ -2122,10 +2119,8 @@ export default function Overlay() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         if (viewerOpenRef.current || dialogOpenRef.current) return;
-        // Swallow auto-repeat and follow-up Esc events for a short
-        // grace period after a successful back-to-menu. Without this a
-        // single press that happens to dispatch two keydowns (OS quirk
-        // / accidental double-tap) cascades into close().
+        // Swallow key-repeat and the immediate native/DOM double-fire after
+        // a back-to-menu Escape, without making normal follow-up Esc feel slow.
         if (e.repeat) {
           e.preventDefault();
           e.stopPropagation();
