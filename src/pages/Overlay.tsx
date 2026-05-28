@@ -1559,6 +1559,37 @@ function SettingsPanel({
   // Which overlay action's shortcut is currently being captured (null = idle).
   const [recordingOverlayAction, setRecordingOverlayAction] = useState<OverlayAction | null>(null);
   const [overlayShortcutError, setOverlayShortcutError] = useState<string>("");
+  // Autostart toggle. `null` while we're still asking Rust on mount so the
+  // switch doesn't flicker on→off during the first render.
+  const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(null);
+  const [autostartBusy, setAutostartBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<boolean>("get_autostart_enabled")
+      .then((value) => { if (!cancelled) setAutostartEnabled(value); })
+      .catch((err) => {
+        console.error("get_autostart_enabled failed", err);
+        if (!cancelled) setAutostartEnabled(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  const toggleAutostart = useCallback(async () => {
+    if (autostartBusy || autostartEnabled === null) return;
+    const next = !autostartEnabled;
+    setAutostartBusy(true);
+    setAutostartEnabled(next); // optimistic so the switch feels instant
+    try {
+      const applied = await invoke<boolean>("set_autostart_enabled", { enabled: next });
+      setAutostartEnabled(applied);
+    } catch (err) {
+      console.error("set_autostart_enabled failed", err);
+      setAutostartEnabled(!next); // revert on error
+    } finally {
+      setAutostartBusy(false);
+    }
+  }, [autostartBusy, autostartEnabled]);
 
   // Capture loop for the in-overlay shortcut rebinder. Listens for the next
   // a-z / 0-9 keypress, validates uniqueness against the other 3 shortcuts,
@@ -1834,6 +1865,38 @@ function SettingsPanel({
                 {recordingOverlayAction
                   ? overlayShortcutError || "Tekan huruf / angka. Esc batal."
                   : overlayShortcutError}
+              </div>
+            </div>
+
+            <div className="border-t border-white/[0.07] pt-4">
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-white/85 text-xs font-semibold">Startup</div>
+              </div>
+              <div className="h-10 flex items-center gap-3 px-3 rounded-lg border border-white/[0.08] bg-zinc-950/70">
+                <span className="flex-1 text-white/82 text-xs">Run on startup</span>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={autostartEnabled === true}
+                  onClick={toggleAutostart}
+                  disabled={autostartEnabled === null || autostartBusy}
+                  className={[
+                    "relative w-9 h-5 rounded-full border transition-colors shrink-0 disabled:opacity-50",
+                    autostartEnabled
+                      ? "bg-white/85 border-white/85"
+                      : "bg-white/[0.10] border-white/[0.18]",
+                  ].join(" ")}
+                  title={autostartEnabled ? "Disable" : "Enable"}
+                >
+                  <span
+                    className={[
+                      "absolute top-[1px] w-[15px] h-[15px] rounded-full transition-all",
+                      autostartEnabled
+                        ? "left-[18px] bg-zinc-950"
+                        : "left-[2px] bg-white/85",
+                    ].join(" ")}
+                  />
+                </button>
               </div>
             </div>
           </div>

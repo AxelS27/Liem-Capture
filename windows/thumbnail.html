@@ -485,6 +485,24 @@
         right: 8px;
       }
 
+      #thumbnail-copy {
+        right: 60px;
+      }
+
+      /* When pinned, close is hidden and pin slides to the rightmost slot,
+         so the copy button takes over pin's old position. */
+      #shell.pinned #thumbnail-copy {
+        right: 34px;
+      }
+
+      /* In preview/editor mode the toolbar already has its own Copy button.
+         Hide the floating-tile copy chip to avoid duplicate UI. */
+      #shell.preview-mode #thumbnail-copy {
+        display: none;
+        opacity: 0;
+        pointer-events: none;
+      }
+
       #minimize {
         display: inline-flex;
         opacity: 0;
@@ -1289,6 +1307,12 @@
       <footer id="bar">
         <div id="track"><div id="progress"></div></div>
       </footer>
+      <button id="thumbnail-copy" class="icon-button" title="Copy to clipboard" aria-label="Copy to clipboard">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <rect x="8" y="3" width="13" height="13" rx="2" stroke="currentColor" stroke-width="1.9" />
+          <path d="M16 21H5a2 2 0 01-2-2V8" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" />
+        </svg>
+      </button>
       <button id="pin" class="icon-button" title="Keep floating" aria-label="Keep floating">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <path d="M12 17v5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" />
@@ -1508,6 +1532,13 @@
             <path d="M5 7h14" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" />
             <path d="M10 11v5M14 11v5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
             <path d="M8 7l.6 12h6.8L16 7M10 7l.7-2h2.6L14 7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+        <span class="toolbar-divider" aria-hidden="true"></span>
+        <button id="tool-copy" class="tool-button" title="Copy to clipboard (Ctrl+C)" aria-label="Copy to clipboard">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <rect x="8" y="3" width="13" height="13" rx="2" stroke="currentColor" stroke-width="1.9" />
+            <path d="M16 21H5a2 2 0 01-2-2V8" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" />
           </svg>
         </button>
         <div id="save-group" class="tool-group">

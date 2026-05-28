@@ -4,6 +4,7 @@
   "description": "Capabilities for the overlay capture window",
   "windows": ["overlay"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "autostart:default"
   ]
 }

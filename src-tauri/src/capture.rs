@@ -757,13 +757,15 @@ pub fn save_edited_thumbnail(
         .map_err(|e| e.to_string())?
         .insert(label, payload.clone());
 
-    // Defer the clipboard push so we can return to JS immediately. The
-    // arboard `set_image` call on Windows can take 30-100ms on a large
-    // shot; doing it inline made every Save feel like a hitch. The image
-    // is moved into the worker, so no extra clone of the full RGBA buffer.
-    std::thread::spawn(move || {
-        let _ = copy_rgba_to_clipboard(&img);
-    });
+    // We intentionally do NOT push the saved image to the OS clipboard
+    // here. The capture path already pushed the original at shot time, so
+    // the user always has *something* on clipboard. Pushing again on save
+    // means a 33MB-RGBA→DIB conversion + a system-wide WM_CLIPBOARDUPDATE
+    // broadcast that every clipboard listener (Win+V history, Discord,
+    // Slack, password managers, …) responds to. On large shots this
+    // stalls the whole desktop for a beat. If the user wants the edited
+    // pixels on clipboard, the explicit Copy button on the thumbnail /
+    // gallery tile does that without the surprise.
     Ok(payload)
 }
 
@@ -842,6 +844,24 @@ pub fn take_fullscreen(app: AppHandle) -> Result<String, String> {
 #[command]
 pub fn copy_to_clipboard(path: String) -> Result<(), String> {
     let img = image::open(&path).map_err(|e| e.to_string())?.to_rgba8();
+    copy_rgba_to_clipboard(&img)
+}
+
+/// Push the editor's current pixels (passed as a PNG data URL) to the OS
+/// clipboard. Separate from `copy_to_clipboard` so the user can copy edits
+/// that have not been saved to disk yet. Explicit-action only — the save
+/// path deliberately does NOT call this (see `save_edited_thumbnail`).
+#[command]
+pub fn copy_image_dataurl_to_clipboard(data_url: String) -> Result<(), String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let encoded = data_url
+        .split_once(',')
+        .map(|(_, data)| data)
+        .unwrap_or(data_url.as_str());
+    let bytes = STANDARD.decode(encoded).map_err(|e| e.to_string())?;
+    let img = image::load_from_memory(&bytes)
+        .map_err(|e| e.to_string())?
+        .to_rgba8();
     copy_rgba_to_clipboard(&img)
 }
 

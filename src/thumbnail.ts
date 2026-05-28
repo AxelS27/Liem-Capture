@@ -94,6 +94,7 @@ const progress = document.querySelector<HTMLDivElement>("#progress")!;
 const pinButton = document.querySelector<HTMLButtonElement>("#pin")!;
 const minimizeButton = document.querySelector<HTMLButtonElement>("#minimize")!;
 const closeButton = document.querySelector<HTMLButtonElement>("#close")!;
+const thumbnailCopyButton = document.querySelector<HTMLButtonElement>("#thumbnail-copy")!;
 const drawGroup = document.querySelector<HTMLDivElement>("#draw-group")!;
 const shapeGroup = document.querySelector<HTMLDivElement>("#shape-group")!;
 const cropGroup = document.querySelector<HTMLDivElement>("#crop-group")!;
@@ -110,6 +111,7 @@ const palette = document.querySelector<HTMLDivElement>("#palette")!;
 const undoButton = document.querySelector<HTMLButtonElement>("#tool-undo")!;
 const redoButton = document.querySelector<HTMLButtonElement>("#tool-redo")!;
 const clearButton = document.querySelector<HTMLButtonElement>("#tool-clear")!;
+const copyButton = document.querySelector<HTMLButtonElement>("#tool-copy")!;
 const saveButton = document.querySelector<HTMLButtonElement>("#tool-save")!;
 const saveGroup = document.querySelector<HTMLDivElement>("#save-group")!;
 
@@ -2201,6 +2203,31 @@ closeButton.addEventListener("click", () => {
   void hideThumbnail();
 });
 
+// Hover-only copy chip on the floating thumbnail tile. Reads the file
+// straight from disk via `copy_to_clipboard` — for the tile (not the
+// editor), the on-disk file IS the source of truth; users see the tile
+// right after capture, before they've had a chance to edit anything.
+// stopPropagation so the underlying preview's pointerdown doesn't also
+// fire and try to start a drag.
+thumbnailCopyButton.addEventListener("pointerdown", (event) => {
+  event.stopPropagation();
+});
+thumbnailCopyButton.addEventListener("click", async (event) => {
+  event.stopPropagation();
+  if (!filePath || isPreviewMode || isDismissing) return;
+  if (thumbnailCopyButton.classList.contains("active")) return;
+  thumbnailCopyButton.classList.add("active");
+  try {
+    await invoke("copy_to_clipboard", { path: filePath });
+    flashStatus("Copied");
+  } catch (error) {
+    console.error(error);
+    flashStatus("Copy failed");
+  } finally {
+    thumbnailCopyButton.classList.remove("active");
+  }
+});
+
 minimizeButton.addEventListener("click", () => {
   if (!isPreviewMode || isPinned) return;
 
@@ -3414,6 +3441,37 @@ async function saveAs() {
   }
 }
 
+// Tracks an in-flight clipboard push so a double-click on the button can't
+// queue up two `set_image` calls in a row. For large shots the second push
+// would be wasted work — Windows would broadcast WM_CLIPBOARDUPDATE twice
+// and every clipboard listener would re-read the same pixels.
+let copyInFlight = false;
+
+async function copyEditorToClipboard() {
+  if (copyInFlight) return;
+  if (!filePath || !isPreviewMode || !isEditorReady) return;
+  copyInFlight = true;
+  copyButton.classList.add("active");
+  flashStatus("Copying…");
+  try {
+    const dataUrl = await canvasToPngDataUrl(editCanvas);
+    await invoke("copy_image_dataurl_to_clipboard", { dataUrl });
+    flashStatus("Copied");
+  } catch (error) {
+    console.error(error);
+    flashStatus("Copy failed");
+  } finally {
+    copyButton.classList.remove("active");
+    copyInFlight = false;
+  }
+}
+
+copyButton.addEventListener("click", (event) => {
+  event.stopPropagation();
+  if (copyButton.disabled) return;
+  void copyEditorToClipboard();
+});
+
 saveButton.addEventListener("click", (event) => {
   event.stopPropagation();
   if (saveButton.disabled) return;
@@ -3538,6 +3596,14 @@ window.addEventListener("keydown", (event) => {
   if (isPreviewMode && isEditorReady && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "y") {
     event.preventDefault();
     redoButton.click();
+    return;
+  }
+
+  // Ctrl+C in the editor → copy current canvas to clipboard. OCR mode has
+  // its own Ctrl+C earlier in this handler, so we don't collide there.
+  if (isPreviewMode && isEditorReady && !isOcrMode && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
+    event.preventDefault();
+    void copyEditorToClipboard();
     return;
   }
 

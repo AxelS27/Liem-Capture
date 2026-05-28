@@ -4,8 +4,10 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Wry,
 };
+use tauri_plugin_autostart::MacosLauncher;
 
 mod ai;
+mod autostart;
 mod capture;
 mod drag;
 mod hotkey;
@@ -50,6 +52,10 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(|app| {
             // Pre-create hidden overlay window so first show is instant
             window::create_overlay(app.handle())?;
@@ -103,12 +109,18 @@ pub fn run() {
 
             hotkey::register_shortcuts(app.handle())?;
 
+            // First-launch policy: enable autostart by default. Subsequent
+            // launches respect whatever the user toggled in settings (the
+            // marker file makes this a one-shot).
+            autostart::ensure_default_enabled(app.handle());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             capture::take_screenshot,
             capture::take_fullscreen,
             capture::copy_to_clipboard,
+            capture::copy_image_dataurl_to_clipboard,
             capture::get_thumbnail_data,
             capture::get_image_data,
             capture::save_edited_thumbnail,
@@ -137,6 +149,8 @@ pub fn run() {
             hotkey::start_hotkey_recording,
             hotkey::stop_hotkey_recording,
             hotkey::reset_capture_hotkey,
+            autostart::get_autostart_enabled,
+            autostart::set_autostart_enabled,
             drag::start_drag,
             window::hide_overlay,
             window::hide_overlay_for_capture,
