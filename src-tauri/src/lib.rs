@@ -38,6 +38,21 @@ pub fn refresh_capture_menu_label(spec: &str) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Keep hidden webviews (overlay, thumbnail pool, preview-transition)
+    // rendering instead of being suspended by Chromium's native-window
+    // occlusion detection. When the overlay is hidden for a capture, its
+    // React state updates and framer-motion animations would otherwise be
+    // deferred until the window is shown again — producing a visible
+    // "wake-up" lag on the next hotkey press (the "feels like a cooldown
+    // after a screenshot" symptom). `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`
+    // is appended to WebView2's default args, so this doesn't clobber
+    // anything Tauri sets up.
+    #[cfg(target_os = "windows")]
+    std::env::set_var(
+        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+        "--disable-features=CalculateNativeWinOcclusion",
+    );
+
     tauri::Builder::default()
         // Single-instance plugin: if the user double-clicks the .exe a second
         // time (or the OS auto-starts it again), the new process exits and

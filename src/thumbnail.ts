@@ -220,6 +220,10 @@ let ocrDragState: {
   startY: number;
   x: number;
   y: number;
+  // false = text-flow selection (Snipping Tool style, the default);
+  // true = rectangular box selection (hold Ctrl). Captured at pointerdown
+  // so toggling Ctrl mid-drag doesn't switch modes underfoot.
+  box: boolean;
 } | null = null;
 
 interface PointerState {
@@ -617,6 +621,9 @@ function captureSnapshot(): HTMLCanvasElement {
 }
 
 function drawSnapshot(snap: HTMLCanvasElement) {
+  // Undo/redo can resize the canvas (e.g. undoing a crop/rotate), which
+  // invalidates the OCR word-box positions — drop them.
+  exitOcrMode();
   baseCanvas.width = snap.width;
   baseCanvas.height = snap.height;
   editLayer.width = baseCanvas.width;
@@ -755,6 +762,58 @@ function selectOcrBoxesInRect(startX: number, startY: number, x: number, y: numb
   updateOcrSelectionClasses();
 }
 
+// OCR boxes sorted into natural reading order (top line first, left word
+// first within a line). Used by the text-flow selection so a drag picks a
+// contiguous run of words the way selecting text in a document would.
+function ocrBoxesInReadingOrder(): OcrBox[] {
+  return [...ocrBoxes].sort(
+    (a, b) => a.line_index - b.line_index || a.word_index - b.word_index,
+  );
+}
+
+// Index (into the reading-order array) of the word a point lands on. If the
+// point isn't inside any box, snap to the nearest one, weighting vertical
+// distance heavily so we lock onto the correct line before picking a word
+// within it — matches how a caret behaves when you drag between lines.
+function ocrReadingIndexAtPoint(ordered: OcrBox[], x: number, y: number): number {
+  for (let i = 0; i < ordered.length; i += 1) {
+    const b = ordered[i];
+    if (x >= b.left && x <= b.right && y >= b.top && y <= b.bottom) return i;
+  }
+  let best = 0;
+  let bestScore = Infinity;
+  for (let i = 0; i < ordered.length; i += 1) {
+    const b = ordered[i];
+    const cx = (b.left + b.right) / 2;
+    const cy = (b.top + b.bottom) / 2;
+    const score = Math.abs(y - cy) * 4 + Math.abs(x - cx);
+    if (score < bestScore) {
+      bestScore = score;
+      best = i;
+    }
+  }
+  return best;
+}
+
+// Text-flow selection: select every word in reading order between the word
+// under the start point and the word under the end point (inclusive). This
+// is the Snipping-Tool-style default — drag from one word to another and
+// everything in between (across line wraps) gets picked, no rectangle.
+function selectOcrBoxesFlow(startX: number, startY: number, x: number, y: number) {
+  const ordered = ocrBoxesInReadingOrder();
+  if (ordered.length === 0) {
+    selectedOcrIds = new Set();
+    updateOcrSelectionClasses();
+    return;
+  }
+  const a = ocrReadingIndexAtPoint(ordered, startX, startY);
+  const b = ocrReadingIndexAtPoint(ordered, x, y);
+  const lo = Math.min(a, b);
+  const hi = Math.max(a, b);
+  selectedOcrIds = new Set(ordered.slice(lo, hi + 1).map((box) => box.id));
+  updateOcrSelectionClasses();
+}
+
 async function copySelectedOcrText() {
   const selected = orderedOcrSelection();
   if (!selected.length) {
@@ -776,15 +835,17 @@ async function copySelectedOcrTextIfAny() {
 }
 
 function enterOcrMode(words: OcrWord[]) {
-  isOcrMode = true;
   drawing = false;
+  // setMode("draw") calls exitOcrMode() internally; run it while isOcrMode
+  // is still false so it no-ops, then flip OCR on afterward.
   setMode("draw");
   setCropRect(null);
+  isOcrMode = true;
   ocrWords = words;
   selectedOcrIds = new Set();
   shell.classList.add("ocr-mode");
   renderOcrLayer(ocrWords);
-  flashStatus(words.length ? "Drag over text to copy" : "No text found");
+  flashStatus(words.length ? "Drag to select · Ctrl+drag for box" : "No text found");
 }
 
 function exitOcrMode() {
@@ -960,6 +1021,12 @@ function shapeContainsPoint(shape: ShapeObject, point: Point) {
 }
 
 function setMode(nextMode: Mode) {
+  // Switching to any draw / shape / crop tool leaves OCR mode. Its word-box
+  // overlay is pinned to the canvas content at OCR time, so it must not
+  // linger once the user starts cropping / drawing (the "OCR boxes stay
+  // stuck after I crop" bug). enterOcrMode sets isOcrMode AFTER its own
+  // setMode("draw") call, so this exitOcrMode() no-ops during OCR entry.
+  exitOcrMode();
   mode = nextMode;
   drawButton.classList.toggle("active", mode === "draw");
   cropButton.classList.toggle("active", mode === "crop");
@@ -1066,6 +1133,16 @@ let loadedFilePath: string | null = null;
 // After a successful save we flip it true; combined with the no-edits
 // check this is what locks the menu until the user makes a new change.
 let hasUserSaved = false;
+// De-duplicates concurrent loadEditorCanvas calls. The background
+// preload kicked off by applyThumbnail and the user's later click-to-
+// enter would otherwise both fetch + decode the same 4K PNG and fight
+// over the global canvases. Same-target callers share the same promise;
+// a different-target caller starts a fresh load while the stale one
+// keeps running in the background (it'll self-cancel via the path
+// check below before writing to the canvas).
+let editorLoadPromise: Promise<void> | null = null;
+let editorLoadTarget: string | null = null;
+let preloadTimerId = 0;
 
 async function loadEditorCanvas() {
   // Fast path: same file, canvases already populated, undo history alive
@@ -1075,32 +1152,76 @@ async function loadEditorCanvas() {
     return;
   }
 
-  const fullImage = await invoke<string>("get_image_data", { path: filePath });
-  const img = new Image();
-  await new Promise<void>((resolve, reject) => {
-    img.onload = () => resolve();
-    img.onerror = () => reject(new Error("Edit preview unavailable"));
-    img.src = `data:image/png;base64,${fullImage}`;
-  });
+  if (editorLoadPromise && editorLoadTarget === filePath) {
+    return editorLoadPromise;
+  }
 
-  editCanvas.width = img.naturalWidth || img.width;
-  editCanvas.height = img.naturalHeight || img.height;
-  baseCanvas.width = editCanvas.width;
-  baseCanvas.height = editCanvas.height;
-  editLayer.width = editCanvas.width;
-  editLayer.height = editCanvas.height;
-  baseCanvas.getContext("2d")?.drawImage(img, 0, 0);
-  layerContext().clearRect(0, 0, editLayer.width, editLayer.height);
-  shapeObjects = [];
-  previewShape = null;
-  cropInteraction = null;
-  setCropRect(null);
-  resetCameraView();
-  renderComposite();
-  undoStack = [captureSnapshot()];
-  redoStack = [];
-  updateHistoryButtons();
-  loadedFilePath = filePath;
+  const targetPath = filePath;
+  const myPromise = (async () => {
+    try {
+      const fullImage = await invoke<string>("get_image_data", { path: targetPath });
+      // If a newer screenshot has replaced this slot mid-fetch, abandon —
+      // letting the load continue would stomp on the canvases with pixels
+      // from the wrong file.
+      if (filePath !== targetPath) return;
+      const img = new Image();
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error("Edit preview unavailable"));
+        img.src = `data:image/png;base64,${fullImage}`;
+      });
+      if (filePath !== targetPath) return;
+
+      editCanvas.width = img.naturalWidth || img.width;
+      editCanvas.height = img.naturalHeight || img.height;
+      baseCanvas.width = editCanvas.width;
+      baseCanvas.height = editCanvas.height;
+      editLayer.width = editCanvas.width;
+      editLayer.height = editCanvas.height;
+      baseCanvas.getContext("2d")?.drawImage(img, 0, 0);
+      layerContext().clearRect(0, 0, editLayer.width, editLayer.height);
+      shapeObjects = [];
+      previewShape = null;
+      cropInteraction = null;
+      setCropRect(null);
+      resetCameraView();
+      renderComposite();
+      undoStack = [captureSnapshot()];
+      redoStack = [];
+      updateHistoryButtons();
+      loadedFilePath = targetPath;
+    } finally {
+      // Only clear the slots if we're still the latest in-flight load.
+      // A newer call may have replaced us — don't clobber its state.
+      if (editorLoadPromise === myPromise) {
+        editorLoadPromise = null;
+        editorLoadTarget = null;
+      }
+    }
+  })();
+  editorLoadPromise = myPromise;
+  editorLoadTarget = targetPath;
+  return editorLoadPromise;
+}
+
+/// Kick off the editor canvas load in the background after a thumbnail
+/// arrives. The user often takes a second or two to look at the tile
+/// before deciding to click it — using that idle time to fetch + decode
+/// the full PNG means the click → preview transition lands on already-
+/// decoded pixels instead of paying the 1-3s IPC + decode cost during
+/// the morph. Bailout if a newer screenshot supersedes this slot.
+function schedulePreloadEditor(targetPath: string) {
+  if (preloadTimerId) {
+    window.clearTimeout(preloadTimerId);
+    preloadTimerId = 0;
+  }
+  preloadTimerId = window.setTimeout(() => {
+    preloadTimerId = 0;
+    if (filePath !== targetPath) return;
+    if (isPreviewMode || isDismissing) return;
+    if (loadedFilePath === filePath) return;
+    void loadEditorCanvas().catch(() => {});
+  }, 220);
 }
 
 function clearHideTimeout() {
@@ -1362,6 +1483,12 @@ function applyThumbnail(data: ThumbnailData) {
   } else {
     restartTimer();
   }
+  // Pre-warm the full editor canvas so a click into preview mode lands
+  // on already-decoded pixels — the morph + window resize were ALREADY
+  // done by the time loadEditorCanvas finished, so the user saw a
+  // visible "waiting" beat after the window jumped to center. Now that
+  // beat is gone (the canvas is loaded long before they reach for it).
+  schedulePreloadEditor(data.path);
 }
 
 async function enterPreviewMode(viewOnly = false) {
@@ -1608,6 +1735,9 @@ function applyCropRect(rect: CropRect) {
 }
 
 function replaceCanvasWith(next: HTMLCanvasElement, before: HTMLCanvasElement, keepCropMode = false) {
+  // Transform / AI upscale / remove-bg all swap the canvas out, which
+  // invalidates the OCR word-box overlay — drop it.
+  exitOcrMode();
   baseCanvas.width = next.width;
   baseCanvas.height = next.height;
   editLayer.width = next.width;
@@ -1684,26 +1814,42 @@ async function runAiAction(action: AiAction, scale = 2) {
       ? `Upscale ${scale}x`
       : action === "remove-bg"
         ? "Remove background"
-        : "OCR copy text";
+        : "OCR";
 
   setAiBusy(true);
   setStatus(`${label}...`);
 
   try {
+    // `before` is a canvas snapshot kept for the undo stack. The AI
+    // commands, however, want a PNG data URL *string* — captureSnapshot
+    // used to return one, but was refactored to return a raw canvas for
+    // fast undo/redo. Passing the canvas straight to invoke serialized it
+    // to "{}" and the command failed (the "OCR doesn't work" bug). Encode
+    // the current canvas to a data URL explicitly for the IPC payload.
     const before = captureSnapshot();
+    const sourceDataUrl = await canvasToPngDataUrl(editCanvas);
 
     if (action === "ocr") {
-      const words = await invoke<OcrWord[]>("ai_ocr_layout", { dataUrl: before });
+      const words = await invoke<OcrWord[]>("ai_ocr_layout", { dataUrl: sourceDataUrl });
       enterOcrMode(words);
       return;
     }
 
-    const dataUrl = action === "upscale"
-      ? await invoke<string>("ai_upscale_image", { dataUrl: before, scale })
-      : await invoke<string>("ai_remove_background", { dataUrl: before });
+    if (action === "upscale") {
+      const result = await invoke<{ dataUrl: string; usedAi: boolean }>("ai_upscale_image", {
+        dataUrl: sourceDataUrl,
+        scale,
+      });
+      const next = await canvasFromDataUrl(result.dataUrl);
+      replaceCanvasWith(next, before, mode === "crop");
+      flashStatus(result.usedAi ? `Upscaled ${scale}x (AI)` : `Upscaled ${scale}x`);
+      return;
+    }
+
+    const dataUrl = await invoke<string>("ai_remove_background", { dataUrl: sourceDataUrl });
     const next = await canvasFromDataUrl(dataUrl);
     replaceCanvasWith(next, before, mode === "crop");
-    flashStatus(action === "upscale" ? `Upscaled ${scale}x` : "Background removed");
+    flashStatus("Background removed");
   } catch (error) {
     flashStatus(String(error));
   } finally {
@@ -1963,6 +2109,21 @@ editCanvas.addEventListener("pointerdown", (event) => {
   editCanvas.setPointerCapture(event.pointerId);
 });
 
+// Apply the current OCR drag selection using whichever mode is active.
+// Box mode (Ctrl) draws the marquee rectangle and picks intersecting words;
+// flow mode (default) hides the rectangle and picks a reading-order run.
+function applyOcrDragSelection() {
+  if (!ocrDragState) return;
+  const { startX, startY, x, y, box } = ocrDragState;
+  if (box) {
+    setOcrSelectionRect(startX, startY, x, y);
+    selectOcrBoxesInRect(startX, startY, x, y);
+  } else {
+    ocrSelection.style.display = "none";
+    selectOcrBoxesFlow(startX, startY, x, y);
+  }
+}
+
 ocrLayer.addEventListener("pointerdown", (event) => {
   if (!isOcrMode || event.button !== 0) return;
 
@@ -1975,10 +2136,13 @@ ocrLayer.addEventListener("pointerdown", (event) => {
     startY: point.y,
     x: point.x,
     y: point.y,
+    box: event.ctrlKey || event.metaKey,
   };
   selectedOcrIds = new Set();
   updateOcrSelectionClasses();
-  setOcrSelectionRect(point.x, point.y, point.x, point.y);
+  // Seed the selection from the press point so a plain click (no drag)
+  // already selects the word under the cursor.
+  applyOcrDragSelection();
   ocrLayer.setPointerCapture(event.pointerId);
 });
 
@@ -1990,8 +2154,7 @@ ocrLayer.addEventListener("pointermove", (event) => {
   const point = localPointInOcrLayer(event);
   ocrDragState.x = point.x;
   ocrDragState.y = point.y;
-  setOcrSelectionRect(ocrDragState.startX, ocrDragState.startY, point.x, point.y);
-  selectOcrBoxesInRect(ocrDragState.startX, ocrDragState.startY, point.x, point.y);
+  applyOcrDragSelection();
 });
 
 ocrLayer.addEventListener("pointerup", (event) => {
@@ -1999,12 +2162,14 @@ ocrLayer.addEventListener("pointerup", (event) => {
 
   event.preventDefault();
   event.stopPropagation();
-  const state = ocrDragState;
+  const point = localPointInOcrLayer(event);
+  ocrDragState.x = point.x;
+  ocrDragState.y = point.y;
+  applyOcrDragSelection();
   ocrDragState = null;
   if (ocrLayer.hasPointerCapture(event.pointerId)) {
     ocrLayer.releasePointerCapture(event.pointerId);
   }
-  selectOcrBoxesInRect(state.startX, state.startY, state.x, state.y);
   ocrSelection.style.display = "none";
   if (selectedOcrIds.size) {
     flashStatus("Text selected");
@@ -2323,12 +2488,30 @@ transformButton.addEventListener("click", () => {
   transformGroup.classList.toggle("open");
 });
 
+const aiUpscaleToggle = document.querySelector<HTMLButtonElement>("#ai-upscale-toggle")!;
+const aiUpscaleScales = document.querySelector<HTMLDivElement>("#ai-upscale-scales")!;
+
+function setUpscaleAccordion(open: boolean) {
+  aiUpscaleScales.hidden = !open;
+  aiUpscaleToggle.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
 aiButton.addEventListener("click", () => {
   drawGroup.classList.remove("open");
   shapeGroup.classList.remove("open");
   cropGroup.classList.remove("open");
   transformGroup.classList.remove("open");
+  const willOpen = !aiGroup.classList.contains("open");
   aiGroup.classList.toggle("open");
+  // Each fresh open of the AI menu starts with the Upscale row collapsed.
+  if (willOpen) setUpscaleAccordion(false);
+});
+
+// "Upscale" row expands to reveal the 2× / 3× / 4× buttons instead of
+// listing all three up front.
+aiUpscaleToggle.addEventListener("click", (event) => {
+  event.stopPropagation();
+  setUpscaleAccordion(aiUpscaleScales.hidden);
 });
 
 document.querySelectorAll<HTMLButtonElement>("[data-crop-ratio]").forEach((button) => {
@@ -2355,6 +2538,7 @@ document.querySelectorAll<HTMLButtonElement>("[data-ai-action]").forEach((button
     const scale = Number(button.dataset.aiScale ?? "2") || 2;
 
     aiGroup.classList.remove("open");
+    setUpscaleAccordion(false);
     void runAiAction(action, scale);
   });
 });

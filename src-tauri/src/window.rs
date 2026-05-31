@@ -752,7 +752,7 @@ pub fn show_overlay(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-fn hide_overlay_impl(app: &AppHandle, resume_timers: bool) {
+fn hide_overlay_impl(app: &AppHandle, resume_timers: bool, resync_hotkey: bool) {
     ESC_POLL.store(false, Ordering::Relaxed);
     if let Some(win) = app.get_webview_window("overlay") {
         let _ = win.hide();
@@ -761,7 +761,13 @@ fn hide_overlay_impl(app: &AppHandle, resume_timers: bool) {
     // main key (held while the user pressed Escape) or a stuck `triggered`
     // flag would silently swallow the next combo press — the symptom being
     // "I had to press Ctrl+C+F twice after Esc before the overlay came back."
-    crate::hotkey::clear_combo_state();
+    //
+    // On the capture path we pass resync=true so the hook re-reads which
+    // combo modifiers are still physically held. Otherwise, finishing a
+    // capture while still holding (say) Ctrl would leave the hook blind to
+    // that Ctrl, and the next combo attempt would need a full re-press —
+    // the "have to press Ctrl+Shift+2 twice after a screenshot" bug.
+    crate::hotkey::clear_combo_state(resync_hotkey);
     if resume_timers {
         resume_thumbnail_timers(app);
     }
@@ -770,12 +776,12 @@ fn hide_overlay_impl(app: &AppHandle, resume_timers: bool) {
 /// Called from JS after crop selection or mode cancel.
 #[command]
 pub fn hide_overlay(app: AppHandle) {
-    hide_overlay_impl(&app, true);
+    hide_overlay_impl(&app, true, false);
 }
 
 #[command]
 pub fn hide_overlay_for_capture(app: AppHandle) {
-    hide_overlay_impl(&app, false);
+    hide_overlay_impl(&app, false, true);
 }
 
 fn hide_thumbnail_impl(app: &AppHandle, label: &str) {
@@ -1119,9 +1125,12 @@ fn ensure_thumbnail(app: &AppHandle, index: u32) -> tauri::Result<()> {
         .disable_drag_drop_handler()
         .build()?;
 
-    // Open DevTools in debug builds to see console errors
-    #[cfg(debug_assertions)]
-    _win.open_devtools();
+    // Intentionally NOT auto-opening DevTools here. WebView2 + open
+    // DevTools paints a viewport-size badge in the top-right corner on
+    // every resize — and the thumbnail window resizes a lot (preview
+    // morph in/out, animated reflows). That badge briefly covers our
+    // Close / Minimize buttons and is the main UX gripe in dev. Use
+    // right-click → Inspect (or Rust-side dbg!) when you need to peek.
 
     Ok(())
 }

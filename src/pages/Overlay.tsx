@@ -2299,6 +2299,16 @@ export default function Overlay() {
     await invoke("hide_overlay_for_capture").catch(() => {});
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     await new Promise((resolve) => setTimeout(resolve, 120));
+    // Clear the closing flags now that the window is hidden. The capture
+    // path used to leave overlayClosing=true forever (only the Esc/close
+    // path reset it), so the NEXT time the overlay was shown via hotkey it
+    // rendered at opacity 0 and only became visible once the reset-overlay
+    // event landed — but a freshly-shown (previously hidden) WebView2 is
+    // throttled and frequently drops that first event, so the overlay
+    // stayed invisible until a second press. Resetting here makes the next
+    // show start at full opacity regardless of event delivery.
+    setOverlayClosing(false);
+    setSelectorClosing(false);
   }, []);
 
   // ── close: synchronous, fire-and-forget hide via Rust ──────────────────────

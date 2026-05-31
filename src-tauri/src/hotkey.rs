@@ -154,13 +154,45 @@ mod global_hotkey_hook {
     use windows::Win32::{
         Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM},
         UI::{
-            Input::KeyboardAndMouse::{VK_LWIN, VK_RWIN},
+            Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LWIN, VK_RWIN},
             WindowsAndMessaging::{
                 CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
                 WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
             },
         },
     };
+
+    /// Map a stored combo token (e.g. "Ctrl", "Shift", "F2", "Numpad5",
+    /// "A", "7") back to a Windows VK code. Used by `clear_state(true)` to
+    /// poll physical key state via `GetAsyncKeyState` so we don't lose
+    /// track of modifiers the user is still holding after a capture.
+    fn vk_from_token(token: &str) -> Option<u32> {
+        match token {
+            "Ctrl" => Some(0x11),
+            "Shift" => Some(0x10),
+            "Alt" => Some(0x12),
+            "Super" => Some(0x5B),
+            s if s.len() == 1 => {
+                let c = s.chars().next()?;
+                if c.is_ascii_alphabetic() {
+                    Some(c.to_ascii_uppercase() as u32)
+                } else if c.is_ascii_digit() {
+                    Some(c as u32)
+                } else {
+                    None
+                }
+            }
+            s if s.starts_with("Numpad") => s[6..]
+                .parse::<u32>()
+                .ok()
+                .and_then(|n| if n <= 9 { Some(0x60 + n) } else { None }),
+            s if s.starts_with('F') && s.len() >= 2 => s[1..]
+                .parse::<u32>()
+                .ok()
+                .and_then(|n| if (1..=24).contains(&n) { Some(0x6F + n) } else { None }),
+            _ => None,
+        }
+    }
 
     static HOOK: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
     static PRESSED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -321,9 +353,37 @@ mod global_hotkey_hook {
     /// Clear the combo latch and any latched main-key state. Called when the
     /// overlay closes so the next combo press always re-fires, regardless of
     /// what release order or missed key-up event may have left behind.
-    pub fn clear_state() {
+    ///
+    /// `resync`: when true, after clearing we poll `GetAsyncKeyState` for the
+    /// combo's MODIFIERS and re-add any that are still physically held. This
+    /// fixes "have to press the hotkey twice after a capture": the capture
+    /// flow clears state while the user may still be holding Ctrl/Shift, and
+    /// without re-syncing the hook would no longer know that modifier is down
+    /// — so the next combo attempt (just tapping the main key) silently fails
+    /// the all-keys-pressed check. We deliberately do NOT re-add held *main*
+    /// keys, so a user who keeps the whole combo pressed doesn't get the
+    /// overlay auto-re-firing on key-repeat.
+    pub fn clear_state(resync: bool) {
+        let combo: Vec<String> = active_hotkey_tokens()
+            .lock()
+            .map(|tokens| tokens.clone())
+            .unwrap_or_default();
+
         if let Ok(mut pressed) = pressed().lock() {
             pressed.clear();
+            if resync {
+                for token in &combo {
+                    if !is_modifier(token) {
+                        continue;
+                    }
+                    if let Some(vk) = vk_from_token(token) {
+                        let held = unsafe { GetAsyncKeyState(vk as i32) as u32 & 0x8000 != 0 };
+                        if held {
+                            pressed.insert(token.clone());
+                        }
+                    }
+                }
+            }
         }
         if let Ok(mut triggered) = triggered().lock() {
             *triggered = false;
@@ -336,15 +396,18 @@ mod global_hotkey_hook {
     pub fn start() -> Result<(), String> {
         Ok(())
     }
-    pub fn clear_state() {}
+    pub fn clear_state(_resync: bool) {}
 }
 
 /// Reset the combo state machine. Called from `hide_overlay_impl` so the
 /// next hotkey press always re-fires after the overlay closes — defends
 /// against the "have to press twice after Escape" symptom where a latched
 /// main key or stuck `triggered` flag would silently swallow the next combo.
-pub fn clear_combo_state() {
-    global_hotkey_hook::clear_state();
+///
+/// `resync` re-reads physical modifier state (see `clear_state`); pass it on
+/// the capture path where the user is likely still holding the combo.
+pub fn clear_combo_state(resync: bool) {
+    global_hotkey_hook::clear_state(resync);
 }
 
 #[cfg(target_os = "windows")]

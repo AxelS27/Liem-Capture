@@ -660,6 +660,46 @@
         color: rgba(255, 255, 255, 0.55) !important;
       }
 
+      /* Upscale accordion: a chevron that rotates when the scale row is
+         expanded, and a compact 2× / 3× / 4× button row revealed below it. */
+      #ai-upscale-toggle .menu-chevron {
+        margin-left: auto;
+        transition: transform 140ms ease;
+      }
+      #ai-upscale-toggle[aria-expanded="true"] .menu-chevron {
+        transform: rotate(90deg);
+      }
+
+      .menu-subrow {
+        display: flex;
+        gap: 4px;
+        padding: 2px 8px 4px 31px;
+      }
+      .menu-subrow[hidden] {
+        display: none;
+      }
+      .scale-btn {
+        flex: 1;
+        height: 26px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 7px;
+        background: rgba(255, 255, 255, 0.06);
+        color: rgba(255, 255, 255, 0.78);
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .scale-btn:hover {
+        background: rgba(255, 255, 255, 0.16);
+        color: rgba(255, 255, 255, 0.98);
+      }
+      .scale-btn:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+        background: rgba(255, 255, 255, 0.06);
+        color: rgba(255, 255, 255, 0.5);
+      }
+
       .menu-label {
         padding: 6px 8px 4px;
         font-size: 10px;
@@ -1475,27 +1515,20 @@
             </svg>
           </button>
           <div id="ai-menu" class="tool-menu">
-            <button class="menu-item" data-ai-action="upscale" data-ai-scale="2">
+            <button id="ai-upscale-toggle" class="menu-item" aria-expanded="false">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                 <path d="M7 17L17 7M11 7h6v6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" />
                 <path d="M5 5h5M5 5v5M19 19h-5M19 19v-5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
               </svg>
-              Upscale 2x
-            </button>
-            <button class="menu-item" data-ai-action="upscale" data-ai-scale="3">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <path d="M7 17L17 7M11 7h6v6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" />
-                <path d="M5 5h5M5 5v5M19 19h-5M19 19v-5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+              <span>Upscale</span>
+              <svg class="menu-chevron" width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
               </svg>
-              Upscale 3x
             </button>
-            <button class="menu-item" data-ai-action="upscale" data-ai-scale="4">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <path d="M7 17L17 7M11 7h6v6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" />
-                <path d="M5 5h5M5 5v5M19 19h-5M19 19v-5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
-              </svg>
-              Upscale 4x
-            </button>
+            <div id="ai-upscale-scales" class="menu-subrow" hidden>
+              <button class="scale-btn" data-ai-action="upscale" data-ai-scale="2">2×</button>
+              <button class="scale-btn" data-ai-action="upscale" data-ai-scale="3">3×</button>
+            </div>
             <button class="menu-item" data-ai-action="remove-bg">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                 <path d="M5 6h14v12H5V6z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" />
@@ -1510,7 +1543,7 @@
                 <path d="M15 4v4h4" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" />
                 <path d="M8.5 11h7M8.5 14h7M8.5 17h4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
               </svg>
-              OCR / Copy text
+              OCR
             </button>
           </div>
         </div>
