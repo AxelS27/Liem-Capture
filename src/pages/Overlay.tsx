@@ -2250,7 +2250,8 @@ function ModeSelector({
   );
 }
 
-export default function Overlay() {
+function OverlayContent() {
+  const dialog = useDialog();
   const canvasRef  = useRef<HTMLCanvasElement>(null);
   const startPt    = useRef<Point | null>(null);
   const cursorPt   = useRef<Point>({ x: 0, y: 0 });
@@ -2393,11 +2394,23 @@ export default function Overlay() {
         // windows). Web Audio's OS mixer continues regardless.
         playShotSfx();
         await hideOverlayBeforeCapture();
-        await invoke("take_fullscreen");
-      })().catch(console.error);
+        try {
+          await invoke("take_fullscreen");
+        } catch (err) {
+          console.error("Fullscreen capture failed:", err);
+          setOverlayClosing(false);
+          setSelectorClosing(false);
+          setMode("select");
+          await invoke("show_overlay_again").catch(console.error);
+          void dialog.alert({
+            title: "Capture Failed",
+            message: `Screen capture failed: ${String(err)}`,
+          });
+        }
+      })();
     }
     // "scroll" = coming soon
-  }, [hideOverlayBeforeCapture]);
+  }, [dialog, hideOverlayBeforeCapture]);
 
   // ── Single keydown listener — registered once, uses refs for latest state ─
   useEffect(() => {
@@ -2502,6 +2515,14 @@ export default function Overlay() {
         });
       } catch (err) {
         console.error("Screenshot failed:", err);
+        setOverlayClosing(false);
+        setSelectorClosing(false);
+        setMode("select");
+        await invoke("show_overlay_again").catch(console.error);
+        void dialog.alert({
+          title: "Capture Failed",
+          message: `Screen capture failed: ${String(err)}`,
+        });
       }
     };
 
@@ -2514,30 +2535,36 @@ export default function Overlay() {
       window.removeEventListener("mouseup",   onUp);
       cancelAnimationFrame(rafRef.current);
     };
-  }, [hideOverlayBeforeCapture, mode]);
+  }, [dialog, hideOverlayBeforeCapture, mode]);
 
   return (
-    <DialogProvider>
-      <motion.div
-        className="fixed inset-0 w-full h-full overflow-hidden"
-        animate={{ opacity: overlayClosing ? 0 : 1 }}
-        transition={{ opacity: { duration: 0.12, ease: "easeOut" } }}
-      >
-        <canvas
-          ref={canvasRef}
-          className="fixed inset-0 w-full h-full"
-          style={{ cursor: "crosshair", display: mode === "crop" ? "block" : "none" }}
+    <motion.div
+      className="fixed inset-0 w-full h-full overflow-hidden"
+      animate={{ opacity: overlayClosing ? 0 : 1 }}
+      transition={{ opacity: { duration: 0.12, ease: "easeOut" } }}
+    >
+      <canvas
+        ref={canvasRef}
+        className="fixed inset-0 w-full h-full"
+        style={{ cursor: "crosshair", display: mode === "crop" ? "block" : "none" }}
+      />
+      {mode === "select" && (
+        <ModeSelector
+          isClosing={selectorClosing}
+          onSelect={handleModeSelect}
+          onClose={close}
+          shortcuts={overlayShortcuts}
+          onShortcutsChange={updateOverlayShortcuts}
         />
-        {mode === "select" && (
-          <ModeSelector
-            isClosing={selectorClosing}
-            onSelect={handleModeSelect}
-            onClose={close}
-            shortcuts={overlayShortcuts}
-            onShortcutsChange={updateOverlayShortcuts}
-          />
-        )}
-      </motion.div>
+      )}
+    </motion.div>
+  );
+}
+
+export default function Overlay() {
+  return (
+    <DialogProvider>
+      <OverlayContent />
     </DialogProvider>
   );
 }

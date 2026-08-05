@@ -1157,7 +1157,8 @@ async function loadEditorCanvas() {
   }
 
   const targetPath = filePath;
-  const myPromise = (async () => {
+  let myPromise: Promise<void> | null = null;
+  myPromise = (async () => {
     try {
       const fullImage = await invoke<string>("get_image_data", { path: targetPath });
       // If a newer screenshot has replaced this slot mid-fetch, abandon —
