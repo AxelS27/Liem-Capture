@@ -69,6 +69,12 @@ fn thumbnail_payloads() -> &'static Mutex<HashMap<String, ThumbnailPayload>> {
     THUMBNAIL_PAYLOADS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+pub fn remove_thumbnail_payload(label: &str) {
+    if let Ok(mut payloads) = thumbnail_payloads().lock() {
+        payloads.remove(label);
+    }
+}
+
 /// Permanent gallery folder under the user's Documents directory. All shots
 /// land here so the in-overlay gallery has a single, persistent source. Falls
 /// back to the system temp dir if the Documents path is unresolvable (e.g.

@@ -218,6 +218,7 @@ fn mark_thumbnail_active(label: &str) {
 }
 
 fn mark_thumbnail_inactive(label: &str) -> bool {
+    crate::capture::remove_thumbnail_payload(label);
     if let Ok(mut pinned) = thumbnail_pinned().lock() {
         pinned.remove(label);
     }
@@ -727,27 +728,29 @@ pub fn show_overlay(app: &AppHandle) -> tauri::Result<()> {
 
     // Spawn a lightweight polling thread to detect Escape without needing a
     // global hotkey registration (bare Escape can't be registered on Windows).
-    ESC_POLL.store(true, Ordering::Relaxed);
-    let app_clone = app.clone();
-    std::thread::spawn(move || {
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-            const VK_ESCAPE: i32 = 0x1B;
+    // Use an atomic swap guard to prevent spawning duplicate polling threads.
+    if !ESC_POLL.swap(true, Ordering::SeqCst) {
+        let app_clone = app.clone();
+        std::thread::spawn(move || {
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                const VK_ESCAPE: i32 = 0x1B;
 
-            while ESC_POLL.load(Ordering::Relaxed) {
-                // High bit set = key is currently held down
-                if GetAsyncKeyState(VK_ESCAPE) < 0 {
-                    ESC_POLL.store(false, Ordering::Relaxed);
-                    if let Some(win) = app_clone.get_webview_window("overlay") {
-                        let _ = win.emit("close-overlay", ());
+                while ESC_POLL.load(Ordering::Relaxed) {
+                    // High bit set = key is currently held down
+                    if GetAsyncKeyState(VK_ESCAPE) < 0 {
+                        ESC_POLL.store(false, Ordering::Relaxed);
+                        if let Some(win) = app_clone.get_webview_window("overlay") {
+                            let _ = win.emit("close-overlay", ());
+                        }
+                        break;
                     }
-                    break;
+                    std::thread::sleep(std::time::Duration::from_millis(16));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(16));
             }
-        }
-    });
+        });
+    }
 
     Ok(())
 }

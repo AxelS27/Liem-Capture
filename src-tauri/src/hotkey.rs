@@ -242,34 +242,27 @@ mod global_hotkey_hook {
                             .lock()
                             .map(|v| v.clone())
                             .unwrap_or_default();
-                        let has_pressed_combo_modifier = combo
-                            .iter()
-                            .any(|item| is_modifier(item) && pressed.contains(item));
-
                         if down {
                             pressed.insert(token.clone());
                         } else {
-                            let latch_main_key = enabled
-                                && !is_modifier(&token)
-                                && combo.contains(&token)
-                                && has_pressed_combo_modifier;
-                            if !latch_main_key {
-                                pressed.remove(&token);
-                            }
+                            pressed.remove(&token);
                             if is_modifier(&token) {
                                 pressed.retain(|item| is_modifier(item));
                             }
-                            if pressed.is_empty() {
-                                if let Ok(mut triggered) = triggered().lock() {
-                                    *triggered = false;
-                                }
+                        }
+
+                        let combo_fully_pressed = !combo.is_empty()
+                            && combo.iter().all(|item| pressed.contains(item));
+
+                        if !combo_fully_pressed {
+                            if let Ok(mut triggered) = triggered().lock() {
+                                *triggered = false;
                             }
                         }
 
                         if down
                             && enabled
-                            && !combo.is_empty()
-                            && combo.iter().all(|item| pressed.contains(item))
+                            && combo_fully_pressed
                         {
                             let mut should_fire = false;
                             if let Ok(mut triggered) = triggered().lock() {
@@ -297,20 +290,18 @@ mod global_hotkey_hook {
                             return LRESULT(1);
                         }
 
-                        // Swallow only NON-modifier combo keys (e.g. "C", "F",
-                        // "2") while a combo modifier is held. Without the
-                        // `!is_modifier` guard the block would also eat plain
-                        // Ctrl / Shift / Alt presses (because a modifier is
-                        // trivially in its own combo + in `pressed`), which
-                        // broke every Ctrl-shortcut in every other app and
-                        // even prevented typing capital letters with Shift.
-                        if enabled
-                            && !is_modifier(&token)
-                            && combo.iter().any(|item| is_modifier(item))
+                        let all_modifiers_pressed = !combo.is_empty()
                             && combo
                                 .iter()
-                                .any(|item| is_modifier(item) && pressed.contains(item))
+                                .filter(|item| is_modifier(item))
+                                .all(|m| pressed.contains(m));
+
+                        // Swallow non-modifier combo keys (e.g. "C", "F", "2") ONLY when
+                        // all required combo modifiers are currently active.
+                        if enabled
+                            && !is_modifier(&token)
                             && combo.iter().any(|item| item == &token)
+                            && all_modifiers_pressed
                         {
                             return LRESULT(1);
                         }
