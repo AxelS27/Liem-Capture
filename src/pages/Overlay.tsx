@@ -716,8 +716,25 @@ function GallerySection({
   // Initial + reset-overlay refresh.
   useEffect(() => { refreshTree(); refreshItems(currentPath); }, [refreshTree, refreshItems, currentPath]);
   useEffect(() => {
-    const unlisten = listen("reset-overlay", () => { refreshTree(); refreshItems(currentPath); });
-    return () => { void unlisten.then((fn) => fn()); };
+    let unlistenFn: (() => void) | null = null;
+    let cancelled = false;
+
+    listen("reset-overlay", () => { refreshTree(); refreshItems(currentPath); })
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlistenFn = fn;
+        }
+      })
+      .catch(console.error);
+
+    return () => {
+      cancelled = true;
+      if (unlistenFn) {
+        unlistenFn();
+      }
+    };
   }, [refreshTree, refreshItems, currentPath]);
 
   const requestPreview = useCallback((path: string) => {
@@ -2351,7 +2368,10 @@ function OverlayContent() {
 
   // Reset when overlay is re-shown
   useEffect(() => {
-    const unlisten = listen("reset-overlay", () => {
+    let unlistenFn: (() => void) | null = null;
+    let cancelled = false;
+
+    listen("reset-overlay", () => {
       if (closeTimerRef.current !== null) {
         window.clearTimeout(closeTimerRef.current);
         closeTimerRef.current = null;
@@ -2362,15 +2382,46 @@ function OverlayContent() {
       modeRef.current = "select";
       startPt.current = null;
       isDragging.current = false;
-    });
-    return () => { unlisten.then((fn) => fn()); };
+    })
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlistenFn = fn;
+        }
+      })
+      .catch(console.error);
+
+    return () => {
+      cancelled = true;
+      if (unlistenFn) {
+        unlistenFn();
+      }
+    };
   }, []);
 
   useEffect(() => {
-    const unlisten = listen("close-overlay", () => {
+    let unlistenFn: (() => void) | null = null;
+    let cancelled = false;
+
+    listen("close-overlay", () => {
       handleEscapeRequest();
-    });
-    return () => { unlisten.then((fn) => fn()); };
+    })
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlistenFn = fn;
+        }
+      })
+      .catch(console.error);
+
+    return () => {
+      cancelled = true;
+      if (unlistenFn) {
+        unlistenFn();
+      }
+    };
   }, [handleEscapeRequest]);
 
   // Size canvas when entering crop mode

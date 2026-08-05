@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{Cursor, Write},
     path::PathBuf,
+    sync::{Mutex, OnceLock},
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -144,6 +145,32 @@ pub fn ai_upscale_image(
     })
 }
 
+static SR_MODEL_PLAN: OnceLock<Mutex<TypedSimplePlan<TypedModel>>> = OnceLock::new();
+
+fn get_sr_model_plan(app: &AppHandle) -> Result<&'static Mutex<TypedSimplePlan<TypedModel>>, String> {
+    if let Some(plan) = SR_MODEL_PLAN.get() {
+        return Ok(plan);
+    }
+    let model_path = ensure_sr_model(app)?;
+    let model = tract_onnx::onnx()
+        .model_for_path(&model_path)
+        .map_err(|e| e.to_string())?
+        .with_input_fact(
+            0,
+            f32::fact([1, 1, SR_TILE as usize, SR_TILE as usize]).into(),
+        )
+        .map_err(|e| e.to_string())?
+        .into_optimized()
+        .map_err(|e| e.to_string())?
+        .into_runnable()
+        .map_err(|e| e.to_string())?;
+
+    let _ = SR_MODEL_PLAN.set(Mutex::new(model));
+    SR_MODEL_PLAN
+        .get()
+        .ok_or_else(|| "Failed to access cached model plan".to_string())
+}
+
 fn ensure_sr_model(app: &AppHandle) -> Result<PathBuf, String> {
     let mut path = ai_model_dir(app)?;
     path.push("super-resolution-10.onnx");
@@ -151,7 +178,11 @@ fn ensure_sr_model(app: &AppHandle) -> Result<PathBuf, String> {
         return Ok(path);
     }
 
-    let response = reqwest::blocking::get(SR_MODEL_URL).map_err(|e| e.to_string())?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client.get(SR_MODEL_URL).send().map_err(|e| e.to_string())?;
     if !response.status().is_success() {
         return Err(format!("Could not download upscale model: {}", response.status()));
     }
@@ -168,23 +199,11 @@ fn ensure_sr_model(app: &AppHandle) -> Result<PathBuf, String> {
 // partial tiles), run each through the model to get a 3× Y plane, and stitch
 // the results. Chroma + alpha are upscaled with a cheap triangle filter.
 fn run_sr_model(app: &AppHandle, img: &RgbaImage) -> Result<RgbaImage, String> {
-    let model_path = ensure_sr_model(app)?;
+    let model_mutex = get_sr_model_plan(app)?;
+    let model = model_mutex.lock().map_err(|e| e.to_string())?;
     let (w, h) = img.dimensions();
     let ow = w * SR_SCALE;
     let oh = h * SR_SCALE;
-
-    let model = tract_onnx::onnx()
-        .model_for_path(&model_path)
-        .map_err(|e| e.to_string())?
-        .with_input_fact(
-            0,
-            f32::fact([1, 1, SR_TILE as usize, SR_TILE as usize]).into(),
-        )
-        .map_err(|e| e.to_string())?
-        .into_optimized()
-        .map_err(|e| e.to_string())?
-        .into_runnable()
-        .map_err(|e| e.to_string())?;
 
     let mut y_out = vec![0u8; (ow as usize) * (oh as usize)];
     let tiles_x = (w + SR_TILE - 1) / SR_TILE;

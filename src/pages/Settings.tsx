@@ -129,11 +129,22 @@ export default function Settings() {
       void invoke("resume_capture_hotkey").catch(console.error);
     };
 
-    const unlistenSuper = listen<{ down: boolean }>("liem-hotkey-super", (event) => {
+    let unlistenSuperFn: (() => void) | null = null;
+    let cancelled = false;
+
+    listen<{ down: boolean }>("liem-hotkey-super", (event) => {
       if (event.payload.down) {
         setError("Windows key tidak didukung — pakai Ctrl / Shift / Alt");
       }
-    });
+    })
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlistenSuperFn = fn;
+        }
+      })
+      .catch(console.error);
 
     const onDown = (e: KeyboardEvent) => {
       if (done) return;
@@ -205,9 +216,12 @@ export default function Settings() {
     window.addEventListener("keyup", onUp, true);
     return () => {
       done = true;
+      cancelled = true;
       window.removeEventListener("keydown", onDown, true);
       window.removeEventListener("keyup", onUp, true);
-      void unlistenSuper.then((fn) => fn());
+      if (unlistenSuperFn) {
+        unlistenSuperFn();
+      }
       void invoke("stop_hotkey_recording").catch(console.error);
       if (!hotkeyEditAppliedRef.current) {
         void invoke("resume_capture_hotkey").catch(console.error);
