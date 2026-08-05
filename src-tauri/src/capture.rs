@@ -123,19 +123,43 @@ pub struct FolderNode {
     pub children: Vec<FolderNode>,
 }
 
+pub fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(components.last(), Some(Component::Normal(_))) {
+                    components.pop();
+                } else {
+                    components.push(component);
+                }
+            }
+            c => components.push(c),
+        }
+    }
+    components.into_iter().collect()
+}
+
 /// Resolve a user-supplied path to one that we are willing to act on.
 /// All gallery operations are sandboxed under the gallery root — this guards
 /// against the frontend (or a hostile caller) handing us something outside
 /// Documents/Liem Capture like "C:\Windows\System32".
 fn resolve_gallery_path(app: &AppHandle, raw: Option<String>) -> Result<PathBuf, String> {
     let root = gallery_dir(app);
-    let candidate = match raw {
+    let raw_path = match raw {
         Some(p) if !p.trim().is_empty() => PathBuf::from(p),
         _ => return Ok(root),
     };
+    let candidate = root.join(raw_path);
     let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-    let canonical_candidate =
-        std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+    let canonical_root = normalize_path(&canonical_root);
+
+    let canonical_candidate = std::fs::canonicalize(&candidate)
+        .unwrap_or_else(|_| normalize_path(&candidate));
+    let canonical_candidate = normalize_path(&canonical_candidate);
+
     if !canonical_candidate.starts_with(&canonical_root) {
         return Err("Path is outside the gallery root".into());
     }
@@ -882,4 +906,21 @@ fn copy_rgba_to_clipboard(img: &image::RgbaImage) -> Result<(), String> {
         bytes: Cow::Borrowed(img.as_raw()),
     })
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_path_basic() {
+        let p = Path::new("/a/b/c/../../d");
+        assert_eq!(normalize_path(p), PathBuf::from("/a/d"));
+    }
+
+    #[test]
+    fn test_normalize_path_traversal() {
+        let p = Path::new("/gallery/subfolder/../../outside/secret.txt");
+        assert_eq!(normalize_path(p), PathBuf::from("/outside/secret.txt"));
+    }
 }

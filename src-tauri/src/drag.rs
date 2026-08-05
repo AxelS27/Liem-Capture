@@ -8,11 +8,11 @@ use tauri::{command, AppHandle};
 pub fn start_drag(app: AppHandle, path: String) -> Result<bool, String> {
     #[cfg(target_os = "windows")]
     {
+        let _ = app;
         let (tx, rx) = mpsc::channel();
-        app.run_on_main_thread(move || {
+        std::thread::spawn(move || {
             let _ = tx.send(windows_drag(&path));
-        })
-        .map_err(|e| e.to_string())?;
+        });
 
         return rx
             .recv()
