@@ -2,7 +2,6 @@ import { Component, ReactNode, ErrorInfo } from "react";
 import { Routes, Route } from "react-router-dom";
 import Settings from "./pages/Settings";
 import Overlay from "./pages/Overlay";
-import Thumbnail from "./pages/Thumbnail";
 import "./App.css";
 
 interface ErrorBoundaryProps {

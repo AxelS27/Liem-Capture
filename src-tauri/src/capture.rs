@@ -823,22 +823,45 @@ pub fn take_screenshot(
     std::thread::sleep(std::time::Duration::from_millis(32));
     let monitors = Monitor::all().map_err(|e| e.to_string())?;
 
+    // Find the monitor whose physical display bounds contain (x, y).
+    // xcap's monitor.x() and monitor.y() return monitor origin. On High-DPI
+    // displays and multi-monitor setups, monitor positions can be reported in
+    // physical screen coordinates or DIPs, while capture_image() yields full physical pixels.
     let monitor = monitors
         .iter()
         .find(|m| {
+            let scale = m.scale_factor() as f64;
             let (mx, my) = (m.x(), m.y());
             let (mw, mh) = (m.width() as i32, m.height() as i32);
-            x >= mx && y >= my && x < mx + mw && y < my + mh
+
+            let (p1_x, p1_y, p1_w, p1_h) = (mx, my, (mw as f64 * scale).round() as i32, (mh as f64 * scale).round() as i32);
+            let (p2_x, p2_y, p2_w, p2_h) = ((mx as f64 * scale).round() as i32, (my as f64 * scale).round() as i32, (mw as f64 * scale).round() as i32, (mh as f64 * scale).round() as i32);
+
+            (x >= p1_x && y >= p1_y && x < p1_x + p1_w && y < p1_y + p1_h)
+                || (x >= p2_x && y >= p2_y && x < p2_x + p2_w && y < p2_y + p2_h)
         })
         .or_else(|| monitors.first())
         .ok_or("No monitor found")?;
 
     let full = monitor.capture_image().map_err(|e| e.to_string())?;
+    let scale = monitor.scale_factor() as f64;
+    let (mx, my) = (monitor.x(), monitor.y());
 
-    let rel_x = (x - monitor.x()).max(0) as u32;
-    let rel_y = (y - monitor.y()).max(0) as u32;
-    let crop_w = width.min(monitor.width().saturating_sub(rel_x));
-    let crop_h = height.min(monitor.height().saturating_sub(rel_y));
+    let phys_mx = if x >= mx && x < mx + full.width() as i32 {
+        mx
+    } else {
+        (mx as f64 * scale).round() as i32
+    };
+    let phys_my = if y >= my && y < my + full.height() as i32 {
+        my
+    } else {
+        (my as f64 * scale).round() as i32
+    };
+
+    let rel_x = (x - phys_mx).max(0) as u32;
+    let rel_y = (y - phys_my).max(0) as u32;
+    let crop_w = width.min(full.width().saturating_sub(rel_x));
+    let crop_h = height.min(full.height().saturating_sub(rel_y));
 
     let cropped = image::imageops::crop_imm(&full, rel_x, rel_y, crop_w, crop_h).to_image();
 
