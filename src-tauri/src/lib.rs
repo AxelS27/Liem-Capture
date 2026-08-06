@@ -72,6 +72,9 @@ pub fn run() {
             None,
         ))
         .setup(|app| {
+            // Clean up any leftover drag temp files from previous sessions
+            drag::cleanup_drag_temp_dir();
+
             // Pre-create hidden overlay window so first show is instant
             window::create_overlay(app.handle())?;
             window::create_preview_transition(app.handle())?;
