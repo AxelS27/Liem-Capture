@@ -19,7 +19,7 @@ pub fn cleanup_drag_temp_dir() {
 }
 
 /// Result of a drag operation. `true` means the user actually dropped onto a
-/// target (Discord, Explorer, a browser…); `false` means the drag was
+/// target (Discord, Explorer, a browser, terminal…); `false` means the drag was
 /// cancelled (Esc, drop on empty area, drop on a non-accepting window).
 #[command]
 pub fn start_drag(app: AppHandle, path: String) -> Result<bool, String> {
@@ -74,7 +74,7 @@ fn windows_drag(path: &str) -> Result<bool, String> {
         Win32::{
             Foundation::{
                 BOOL, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS,
-                DV_E_FORMATETC, E_NOTIMPL, E_POINTER, OLE_E_ADVISENOTSUPPORTED, POINT, S_FALSE,
+                DV_E_FORMATETC, E_NOTIMPL, E_POINTER, E_UNEXPECTED, OLE_E_ADVISENOTSUPPORTED, POINT, S_FALSE,
             },
             System::{
                 Com::{
@@ -85,7 +85,7 @@ fn windows_drag(path: &str) -> Result<bool, String> {
                 Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
                 Ole::{
                     DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, OleUninitialize,
-                    CF_HDROP, CF_UNICODETEXT, DROPEFFECT, DROPEFFECT_COPY,
+                    CF_HDROP, CF_TEXT, CF_UNICODETEXT, DROPEFFECT, DROPEFFECT_COPY,
                 },
                 SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS},
             },
@@ -103,6 +103,7 @@ fn windows_drag(path: &str) -> Result<bool, String> {
         }
     }
 
+    /// Enumerates offered OLE data formats (`CF_HDROP`, `CF_UNICODETEXT`, `CF_TEXT`).
     #[implement(IEnumFORMATETC)]
     struct FormatEnumerator {
         index: Cell<usize>,
@@ -110,55 +111,94 @@ fn windows_drag(path: &str) -> Result<bool, String> {
 
     impl IEnumFORMATETC_Impl for FormatEnumerator_Impl {
         fn Next(&self, celt: u32, rgelt: *mut FORMATETC, pceltfetched: *mut u32) -> HRESULT {
-            if rgelt.is_null() || (celt > 1 && pceltfetched.is_null()) {
-                return E_POINTER;
-            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if rgelt.is_null() || (celt > 1 && pceltfetched.is_null()) {
+                    return E_POINTER;
+                }
 
-            let formats = [CF_HDROP.0, CF_UNICODETEXT.0];
-            let mut fetched = 0u32;
-            let mut cur = self.index.get();
+                if celt == 0 {
+                    if !pceltfetched.is_null() {
+                        unsafe {
+                            *pceltfetched = 0;
+                        }
+                    }
+                    return HRESULT(0);
+                }
 
-            while cur < formats.len() && fetched < celt {
+                let formats = [CF_HDROP.0, CF_UNICODETEXT.0, CF_TEXT.0];
+                let mut fetched = 0u32;
+                let mut cur = self.index.get();
+
+                while cur < formats.len() && fetched < celt {
+                    unsafe {
+                        ptr::write(rgelt.add(fetched as usize), format_etc(formats[cur]));
+                    }
+                    fetched += 1;
+                    cur += 1;
+                }
+
+                self.index.set(cur);
+
                 unsafe {
-                    ptr::write(rgelt.add(fetched as usize), format_etc(formats[cur]));
+                    if !pceltfetched.is_null() {
+                        *pceltfetched = fetched;
+                    }
                 }
-                fetched += 1;
-                cur += 1;
-            }
 
-            self.index.set(cur);
-
-            unsafe {
-                if !pceltfetched.is_null() {
-                    *pceltfetched = fetched;
+                if fetched == celt {
+                    HRESULT(0)
+                } else {
+                    S_FALSE
                 }
-            }
+            }));
 
-            if fetched == celt {
-                HRESULT(0)
-            } else {
-                S_FALSE
+            match result {
+                Ok(hr) => hr,
+                Err(_) => E_UNEXPECTED,
             }
         }
 
         fn Skip(&self, celt: u32) -> WinResult<()> {
-            let new_idx = (self.index.get() + celt as usize).min(2);
-            self.index.set(new_idx);
-            Ok(())
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let formats_count = 3;
+                let new_idx = (self.index.get() + celt as usize).min(formats_count);
+                self.index.set(new_idx);
+            }));
+
+            match result {
+                Ok(()) => Ok(()),
+                Err(_) => Err(Error::from_hresult(E_UNEXPECTED)),
+            }
         }
 
         fn Reset(&self) -> WinResult<()> {
-            self.index.set(0);
-            Ok(())
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.index.set(0);
+            }));
+
+            match result {
+                Ok(()) => Ok(()),
+                Err(_) => Err(Error::from_hresult(E_UNEXPECTED)),
+            }
         }
 
         fn Clone(&self) -> WinResult<IEnumFORMATETC> {
-            Ok(IEnumFORMATETC::from(FormatEnumerator {
-                index: Cell::new(self.index.get()),
-            }))
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                IEnumFORMATETC::from(FormatEnumerator {
+                    index: Cell::new(self.index.get()),
+                })
+            }));
+
+            match result {
+                Ok(enum_obj) => Ok(enum_obj),
+                Err(_) => Err(Error::from_hresult(E_UNEXPECTED)),
+            }
         }
     }
 
+    /// Implements `IDataObject` for native Windows drag-and-drop operations.
+    /// Exposes `CF_HDROP`, `CF_UNICODETEXT`, and `CF_TEXT` formats to support
+    /// drop targets ranging from file explorers to terminal emulators.
     #[implement(IDataObject)]
     struct FileDragData {
         path: String,
@@ -166,7 +206,9 @@ fn windows_drag(path: &str) -> Result<bool, String> {
 
     impl FileDragData {
         fn supports(format: &FORMATETC) -> bool {
-            (format.cfFormat == CF_HDROP.0 || format.cfFormat == CF_UNICODETEXT.0)
+            (format.cfFormat == CF_HDROP.0
+                || format.cfFormat == CF_UNICODETEXT.0
+                || format.cfFormat == CF_TEXT.0)
                 && format.dwAspect == DVASPECT_CONTENT.0
                 && (format.tymed & TYMED_HGLOBAL.0 as u32) != 0
         }
@@ -236,91 +278,200 @@ fn windows_drag(path: &str) -> Result<bool, String> {
                 pUnkForRelease: ManuallyDrop::new(None),
             })
         }
+
+        unsafe fn cf_text_medium(&self) -> WinResult<STGMEDIUM> {
+            let mut ansi_bytes = self.path.as_bytes().to_vec();
+            ansi_bytes.push(0);
+
+            let byte_len = ansi_bytes.len();
+            let hglobal = GlobalAlloc(GMEM_MOVEABLE, byte_len)?;
+            let raw = GlobalLock(hglobal);
+
+            if raw.is_null() {
+                return Err(Error::from_win32());
+            }
+
+            ptr::copy_nonoverlapping(
+                ansi_bytes.as_ptr(),
+                raw as *mut u8,
+                byte_len,
+            );
+
+            let _ = GlobalUnlock(hglobal);
+
+            Ok(STGMEDIUM {
+                tymed: TYMED_HGLOBAL.0 as u32,
+                u: STGMEDIUM_0 { hGlobal: hglobal },
+                pUnkForRelease: ManuallyDrop::new(None),
+            })
+        }
     }
 
     impl IDataObject_Impl for FileDragData_Impl {
         fn GetData(&self, pformatetcin: *const FORMATETC) -> WinResult<STGMEDIUM> {
-            unsafe {
-                if pformatetcin.is_null() || !FileDragData::supports(&*pformatetcin) {
-                    return Err(Error::from_hresult(DV_E_FORMATETC));
-                }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                unsafe {
+                    if pformatetcin.is_null() {
+                        return Err(Error::from_hresult(E_POINTER));
+                    }
 
-                let fmt = &*pformatetcin;
-                if fmt.cfFormat == CF_HDROP.0 {
-                    self.hdrop_medium()
-                } else if fmt.cfFormat == CF_UNICODETEXT.0 {
-                    self.unicode_text_medium()
-                } else {
-                    Err(Error::from_hresult(DV_E_FORMATETC))
+                    let fmt = &*pformatetcin;
+                    if !FileDragData::supports(fmt) {
+                        return Err(Error::from_hresult(DV_E_FORMATETC));
+                    }
+
+                    if fmt.cfFormat == CF_HDROP.0 {
+                        self.hdrop_medium()
+                    } else if fmt.cfFormat == CF_UNICODETEXT.0 {
+                        self.unicode_text_medium()
+                    } else if fmt.cfFormat == CF_TEXT.0 {
+                        self.cf_text_medium()
+                    } else {
+                        Err(Error::from_hresult(DV_E_FORMATETC))
+                    }
                 }
+            }));
+
+            match result {
+                Ok(res) => res,
+                Err(_) => Err(Error::from_hresult(E_UNEXPECTED)),
             }
         }
 
         fn GetDataHere(
             &self,
-            _pformatetc: *const FORMATETC,
+            pformatetc: *const FORMATETC,
             _pmedium: *mut STGMEDIUM,
         ) -> WinResult<()> {
-            Err(Error::from_hresult(E_NOTIMPL))
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if pformatetc.is_null() {
+                    return Err(Error::from_hresult(E_POINTER));
+                }
+                Err(Error::from_hresult(E_NOTIMPL))
+            }));
+
+            match result {
+                Ok(res) => res,
+                Err(_) => Err(Error::from_hresult(E_UNEXPECTED)),
+            }
         }
 
         fn QueryGetData(&self, pformatetc: *const FORMATETC) -> HRESULT {
-            unsafe {
-                if !pformatetc.is_null() && FileDragData::supports(&*pformatetc) {
-                    HRESULT(0)
-                } else {
-                    DV_E_FORMATETC
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                unsafe {
+                    if pformatetc.is_null() {
+                        return E_POINTER;
+                    }
+                    if FileDragData::supports(&*pformatetc) {
+                        HRESULT(0)
+                    } else {
+                        DV_E_FORMATETC
+                    }
                 }
+            }));
+
+            match result {
+                Ok(hr) => hr,
+                Err(_) => E_UNEXPECTED,
             }
         }
 
         fn GetCanonicalFormatEtc(
             &self,
-            _pformatectin: *const FORMATETC,
+            pformatetcin: *const FORMATETC,
             pformatetcout: *mut FORMATETC,
         ) -> HRESULT {
-            unsafe {
-                if !pformatetcout.is_null() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if pformatetcin.is_null() || pformatetcout.is_null() {
+                    return E_POINTER;
+                }
+                unsafe {
                     (*pformatetcout).ptd = ptr::null_mut();
                 }
+                S_FALSE
+            }));
+
+            match result {
+                Ok(hr) => hr,
+                Err(_) => E_UNEXPECTED,
             }
-            S_FALSE
         }
 
         fn SetData(
             &self,
-            _pformatetc: *const FORMATETC,
-            _pmedium: *const STGMEDIUM,
+            pformatetc: *const FORMATETC,
+            pmedium: *const STGMEDIUM,
             _frelease: BOOL,
         ) -> WinResult<()> {
-            Err(Error::from_hresult(E_NOTIMPL))
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if pformatetc.is_null() || pmedium.is_null() {
+                    return Err(Error::from_hresult(E_POINTER));
+                }
+                Err(Error::from_hresult(E_NOTIMPL))
+            }));
+
+            match result {
+                Ok(res) => res,
+                Err(_) => Err(Error::from_hresult(E_UNEXPECTED)),
+            }
         }
 
         fn EnumFormatEtc(&self, dwdirection: u32) -> WinResult<IEnumFORMATETC> {
-            if dwdirection == DATADIR_GET.0 as u32 {
-                Ok(IEnumFORMATETC::from(FormatEnumerator {
-                    index: Cell::new(0),
-                }))
-            } else {
-                Err(Error::from_hresult(DV_E_FORMATETC))
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if dwdirection == DATADIR_GET.0 as u32 {
+                    Ok(IEnumFORMATETC::from(FormatEnumerator {
+                        index: Cell::new(0),
+                    }))
+                } else {
+                    Err(Error::from_hresult(DV_E_FORMATETC))
+                }
+            }));
+
+            match result {
+                Ok(res) => res,
+                Err(_) => Err(Error::from_hresult(E_UNEXPECTED)),
             }
         }
 
         fn DAdvise(
             &self,
-            _pformatetc: *const FORMATETC,
+            pformatetc: *const FORMATETC,
             _advf: u32,
             _padvsink: Option<&IAdviseSink>,
         ) -> WinResult<u32> {
-            Err(Error::from_hresult(OLE_E_ADVISENOTSUPPORTED))
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if pformatetc.is_null() {
+                    return Err(Error::from_hresult(E_POINTER));
+                }
+                Err(Error::from_hresult(OLE_E_ADVISENOTSUPPORTED))
+            }));
+
+            match result {
+                Ok(res) => res,
+                Err(_) => Err(Error::from_hresult(E_UNEXPECTED)),
+            }
         }
 
         fn DUnadvise(&self, _dwconnection: u32) -> WinResult<()> {
-            Err(Error::from_hresult(OLE_E_ADVISENOTSUPPORTED))
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Err(Error::from_hresult(OLE_E_ADVISENOTSUPPORTED))
+            }));
+
+            match result {
+                Ok(res) => res,
+                Err(_) => Err(Error::from_hresult(E_UNEXPECTED)),
+            }
         }
 
         fn EnumDAdvise(&self) -> WinResult<IEnumSTATDATA> {
-            Err(Error::from_hresult(OLE_E_ADVISENOTSUPPORTED))
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Err(Error::from_hresult(OLE_E_ADVISENOTSUPPORTED))
+            }));
+
+            match result {
+                Ok(res) => res,
+                Err(_) => Err(Error::from_hresult(E_UNEXPECTED)),
+            }
         }
     }
 
@@ -333,17 +484,31 @@ fn windows_drag(path: &str) -> Result<bool, String> {
             fescapepressed: BOOL,
             grfkeystate: MODIFIERKEYS_FLAGS,
         ) -> HRESULT {
-            if fescapepressed.as_bool() {
-                DRAGDROP_S_CANCEL
-            } else if (grfkeystate & MK_LBUTTON).0 == 0 {
-                DRAGDROP_S_DROP
-            } else {
-                HRESULT(0)
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if fescapepressed.as_bool() {
+                    DRAGDROP_S_CANCEL
+                } else if (grfkeystate & MK_LBUTTON).0 == 0 {
+                    DRAGDROP_S_DROP
+                } else {
+                    HRESULT(0)
+                }
+            }));
+
+            match result {
+                Ok(hr) => hr,
+                Err(_) => E_UNEXPECTED,
             }
         }
 
         fn GiveFeedback(&self, _dweffect: DROPEFFECT) -> HRESULT {
-            DRAGDROP_S_USEDEFAULTCURSORS
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                DRAGDROP_S_USEDEFAULTCURSORS
+            }));
+
+            match result {
+                Ok(hr) => hr,
+                Err(_) => E_UNEXPECTED,
+            }
         }
     }
 
@@ -375,6 +540,96 @@ fn windows_drag(path: &str) -> Result<bool, String> {
         } else {
             Err(format!("DoDragDrop failed: 0x{:08x}", hr.0 as u32))
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[cfg(test)]
+mod windows_ole_tests {
+    use super::*;
+
+    #[test]
+    fn test_format_enumerator_next_skip_reset_clone() {
+        let enumerator = IEnumFORMATETC::from(FormatEnumerator {
+            index: Cell::new(0),
+        });
+        let mut fmt = FORMATETC::default();
+        let mut fetched = 0u32;
+        let hr = unsafe { enumerator.Next(1, &mut fmt, &mut fetched) };
+        assert_eq!(hr, HRESULT(0));
+        assert_eq!(fetched, 1);
+        assert_eq!(fmt.cfFormat, CF_HDROP.0);
+
+        let hr = unsafe { enumerator.Next(1, &mut fmt, &mut fetched) };
+        assert_eq!(hr, HRESULT(0));
+        assert_eq!(fetched, 1);
+        assert_eq!(fmt.cfFormat, CF_UNICODETEXT.0);
+
+        let hr = unsafe { enumerator.Next(1, &mut fmt, &mut fetched) };
+        assert_eq!(hr, HRESULT(0));
+        assert_eq!(fetched, 1);
+        assert_eq!(fmt.cfFormat, CF_TEXT.0);
+
+        let hr = unsafe { enumerator.Next(1, &mut fmt, &mut fetched) };
+        assert_eq!(hr, S_FALSE);
+        assert_eq!(fetched, 0);
+
+        assert!(unsafe { enumerator.Reset() }.is_ok());
+
+        let hr = unsafe { enumerator.Next(1, ptr::null_mut(), &mut fetched) };
+        assert_eq!(hr, E_POINTER);
+    }
+
+    #[test]
+    fn test_file_drag_data_supports_cf_text() {
+        let fmt_text = format_etc(CF_TEXT.0);
+        assert!(FileDragData::supports(&fmt_text));
+
+        let fmt_hdrop = format_etc(CF_HDROP.0);
+        assert!(FileDragData::supports(&fmt_hdrop));
+
+        let fmt_unicode = format_etc(CF_UNICODETEXT.0);
+        assert!(FileDragData::supports(&fmt_unicode));
+
+        let fmt_dib = format_etc(8); // CF_DIB
+        assert!(!FileDragData::supports(&fmt_dib));
+    }
+
+    #[test]
+    fn test_file_drag_data_com_methods_null_pointers() {
+        let drag_data = IDataObject::from(FileDragData {
+            path: "C:\\test\\file.png".to_string(),
+        });
+
+        let res = unsafe { drag_data.GetData(ptr::null()) };
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code(), E_POINTER);
+
+        let hr = unsafe { drag_data.QueryGetData(ptr::null()) };
+        assert_eq!(hr, E_POINTER);
+
+        let fmt_dib = format_etc(8);
+        let hr = unsafe { drag_data.QueryGetData(&fmt_dib) };
+        assert_eq!(hr, DV_E_FORMATETC);
+
+        let fmt_text = format_etc(CF_TEXT.0);
+        let hr = unsafe { drag_data.QueryGetData(&fmt_text) };
+        assert_eq!(hr, HRESULT(0));
+    }
+
+    #[test]
+    fn test_cf_text_medium_content() {
+        let drag_data_impl = FileDragData_Impl {
+            path: "C:\\tmp\\test.png".to_string(),
+        };
+        let medium = unsafe { drag_data_impl.cf_text_medium() }.expect("cf_text_medium failed");
+        assert_eq!(medium.tymed, TYMED_HGLOBAL.0 as u32);
+        let hglobal = unsafe { medium.u.hGlobal };
+        let raw = unsafe { GlobalLock(hglobal) } as *const u8;
+        assert!(!raw.is_null());
+        let c_str = unsafe { std::ffi::CStr::from_ptr(raw as *const i8) };
+        assert_eq!(c_str.to_str().unwrap(), "C:\\tmp\\test.png");
+        let _ = unsafe { GlobalUnlock(hglobal) };
     }
 }
 
