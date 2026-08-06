@@ -1157,8 +1157,8 @@ async function loadEditorCanvas() {
   }
 
   const targetPath = filePath;
-  let myPromise: Promise<void> | null = null;
-  myPromise = (async () => {
+  let selfPromise: Promise<void> | undefined;
+  const loadTask = async () => {
     try {
       const fullImage = await invoke<string>("get_image_data", { path: targetPath });
       // If a newer screenshot has replaced this slot mid-fetch, abandon —
@@ -1194,13 +1194,14 @@ async function loadEditorCanvas() {
     } finally {
       // Only clear the slots if we're still the latest in-flight load.
       // A newer call may have replaced us — don't clobber its state.
-      if (editorLoadPromise === myPromise) {
+      if (editorLoadPromise === selfPromise) {
         editorLoadPromise = null;
         editorLoadTarget = null;
       }
     }
-  })();
-  editorLoadPromise = myPromise;
+  };
+  selfPromise = loadTask();
+  editorLoadPromise = selfPromise;
   editorLoadTarget = targetPath;
   return editorLoadPromise;
 }

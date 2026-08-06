@@ -287,17 +287,42 @@ fn ease_out_cubic(t: f64) -> f64 {
     1.0 - (1.0 - t).powi(3)
 }
 
+static THUMBNAIL_ANIMATION_TOKENS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+fn thumbnail_animation_tokens() -> &'static Mutex<HashMap<String, u64>> {
+    THUMBNAIL_ANIMATION_TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_thumbnail_animation_token(label: &str) -> u64 {
+    let mut tokens = thumbnail_animation_tokens().lock().unwrap();
+    let next = tokens.get(label).copied().unwrap_or(0) + 1;
+    tokens.insert(label.to_string(), next);
+    next
+}
+
+fn thumbnail_animation_token_matches(label: &str, token: u64) -> bool {
+    thumbnail_animation_tokens()
+        .lock()
+        .map(|tokens| tokens.get(label).copied() == Some(token))
+        .unwrap_or(false)
+}
+
 fn animate_thumbnail_frame(
     app: AppHandle,
     label: String,
     start: (f64, f64, f64, f64),
     target: (f64, f64, f64, f64),
 ) {
-    std::thread::spawn(move || {
+    let token = next_thumbnail_animation_token(&label);
+    tauri::async_runtime::spawn(async move {
         let duration = Duration::from_millis(280);
         let started = Instant::now();
 
         loop {
+            if !thumbnail_animation_token_matches(&label, token) {
+                return;
+            }
+
             let elapsed = started.elapsed();
             let t = ease_out_cubic(elapsed.as_secs_f64() / duration.as_secs_f64());
             let x = start.0 + ((target.0 - start.0) * t);
@@ -310,10 +335,12 @@ fn animate_thumbnail_frame(
                 break;
             }
 
-            std::thread::sleep(Duration::from_millis(8));
+            tokio::time::sleep(Duration::from_millis(8)).await;
         }
 
-        set_thumbnail_frame(&app, &label, target.0, target.1, target.2, target.3);
+        if thumbnail_animation_token_matches(&label, token) {
+            set_thumbnail_frame(&app, &label, target.0, target.1, target.2, target.3);
+        }
     });
 }
 
@@ -350,7 +377,7 @@ fn reflow_thumbnails(app: &AppHandle, animate: bool) {
     }
 
     let app = app.clone();
-    std::thread::spawn(move || {
+    tauri::async_runtime::spawn(async move {
         let duration = Duration::from_millis(240);
         let started = Instant::now();
 
@@ -372,11 +399,13 @@ fn reflow_thumbnails(app: &AppHandle, animate: bool) {
                 break;
             }
 
-            std::thread::sleep(Duration::from_millis(8));
+            tokio::time::sleep(Duration::from_millis(8)).await;
         }
 
-        for (label, _, (x, y)) in targets {
-            set_thumbnail_position(&app, &label, x, y);
+        if THUMBNAIL_REFLOW_TOKEN.load(Ordering::Relaxed) == token {
+            for (label, _, (x, y)) in targets {
+                set_thumbnail_position(&app, &label, x, y);
+            }
         }
     });
 }
@@ -931,8 +960,8 @@ pub fn hide_preview_transition(app: AppHandle) {
     if let Some(win) = app.get_webview_window("preview-transition") {
         let _ = win.emit("liem-preview-transition-hide", ());
         let win = win.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
             let _ = win.hide();
         });
     }
@@ -1028,50 +1057,52 @@ fn schedule_thumbnail_hide(app: &AppHandle, label: &str, token: u64) {
     let app = app.clone();
     let label = label.to_string();
 
-    std::thread::spawn(move || loop {
-        let sleep_for = {
-            let Ok(timers) = thumbnail_timers().lock() else {
-                return;
-            };
-            let Some(timer) = timers.get(&label) else {
-                return;
-            };
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let sleep_for = {
+                let Ok(timers) = thumbnail_timers().lock() else {
+                    return;
+                };
+                let Some(timer) = timers.get(&label) else {
+                    return;
+                };
 
-            if timer.token != token || !thumbnail_hide_token_matches(&label, token) {
-                return;
-            }
-
-            if timer.paused {
-                Duration::from_millis(80)
-            } else {
-                let remaining = timer.deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    drop(timers);
-                    // Delegate to JS so the dismiss animation plays. JS then
-                    // invokes `hide_thumbnail`, which performs the native
-                    // window.hide() and final cleanup. We cancel the timer
-                    // here so this thread does not loop again before JS
-                    // responds. If the window is missing (JS dead/unloaded)
-                    // we still fall back to a direct hide.
-                    cancel_thumbnail_timer(&label);
-                    if let Some(win) = app.get_webview_window(&label) {
-                        // emit() in Tauri v2 broadcasts to every webview, so
-                        // include the label in the payload and let each
-                        // thumbnail's JS filter by `currentWindow.label`.
-                        // Otherwise every thumbnail dismisses together when
-                        // any one of them times out.
-                        if win.emit("liem-thumbnail-auto-dismiss", &label).is_ok() {
-                            return;
-                        }
-                    }
-                    hide_thumbnail_impl(&app, &label);
+                if timer.token != token || !thumbnail_hide_token_matches(&label, token) {
                     return;
                 }
-                remaining.min(Duration::from_millis(80))
-            }
-        };
 
-        std::thread::sleep(sleep_for);
+                if timer.paused {
+                    Duration::from_millis(80)
+                } else {
+                    let remaining = timer.deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        drop(timers);
+                        // Delegate to JS so the dismiss animation plays. JS then
+                        // invokes `hide_thumbnail`, which performs the native
+                        // window.hide() and final cleanup. We cancel the timer
+                        // here so this thread does not loop again before JS
+                        // responds. If the window is missing (JS dead/unloaded)
+                        // we still fall back to a direct hide.
+                        cancel_thumbnail_timer(&label);
+                        if let Some(win) = app.get_webview_window(&label) {
+                            // emit() in Tauri v2 broadcasts to every webview, so
+                            // include the label in the payload and let each
+                            // thumbnail's JS filter by `currentWindow.label`.
+                            // Otherwise every thumbnail dismisses together when
+                            // any one of them times out.
+                            if win.emit("liem-thumbnail-auto-dismiss", &label).is_ok() {
+                                return;
+                            }
+                        }
+                        hide_thumbnail_impl(&app, &label);
+                        return;
+                    }
+                    remaining.min(Duration::from_millis(80))
+                }
+            };
+
+            tokio::time::sleep(sleep_for).await;
+        }
     });
 }
 

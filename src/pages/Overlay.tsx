@@ -713,6 +713,33 @@ function GallerySection({
       .catch((err) => { console.error(err); setInitialLoading(false); });
   }, []);
 
+  // Reset preview memory state on folder navigation to prevent unbounded RAM growth.
+  useEffect(() => {
+    setPreviews({});
+    previewsRef.current = {};
+    previewRequests.current.clear();
+    setMetadataCache({});
+    setSelectedPath(null);
+  }, [currentPath]);
+
+  const MAX_PREVIEW_CACHE = 80;
+
+  const updatePreviewCache = useCallback((path: string, b64: string) => {
+    setPreviews((prev) => {
+      const keys = Object.keys(prev);
+      if (keys.length >= MAX_PREVIEW_CACHE && !prev[path]) {
+        const next = { ...prev };
+        delete next[keys[0]];
+        next[path] = b64;
+        previewsRef.current = next;
+        return next;
+      }
+      const next = { ...prev, [path]: b64 };
+      previewsRef.current = next;
+      return next;
+    });
+  }, []);
+
   // Initial + reset-overlay refresh.
   useEffect(() => { refreshTree(); refreshItems(currentPath); }, [refreshTree, refreshItems, currentPath]);
   useEffect(() => {
@@ -742,25 +769,25 @@ function GallerySection({
     previewRequests.current.add(path);
     invoke<string>("get_gallery_preview", { path })
       .then((b64) => {
-        setPreviews((prev) => ({ ...prev, [path]: b64 }));
+        updatePreviewCache(path, b64);
       })
       .catch((error) => {
         previewRequests.current.delete(path);
         console.error(error);
       });
-  }, []);
+  }, [updatePreviewCache]);
 
   const loadPreview = useCallback(async (path: string) => {
     if (previewsRef.current[path] || previewRequests.current.has(path)) return;
     previewRequests.current.add(path);
     try {
       const b64 = await invoke<string>("get_gallery_preview", { path });
-      setPreviews((prev) => ({ ...prev, [path]: b64 }));
+      updatePreviewCache(path, b64);
     } catch (error) {
       previewRequests.current.delete(path);
       console.error(error);
     }
-  }, []);
+  }, [updatePreviewCache]);
 
   const requestMetadata = useCallback((path: string) => {
     if (metadataCache[path]) return;
@@ -2549,6 +2576,14 @@ function OverlayContent() {
         oy = pos.y;
       } catch {}
 
+      // Calculate physical pixels with end-point subtraction to prevent 1px boundary gaps on non-integer DPRs (125%, 150%)
+      const physX = Math.round(rect.x * dpr);
+      const physY = Math.round(rect.y * dpr);
+      const physRight = Math.round((rect.x + rect.w) * dpr);
+      const physBottom = Math.round((rect.y + rect.h) * dpr);
+      const physW = Math.max(1, physRight - physX);
+      const physH = Math.max(1, physBottom - physY);
+
       // Fire sfx BEFORE hiding so the audio stream starts while our
       // webview is still visible. Web Audio drives the OS mixer directly,
       // so playback survives the subsequent win.hide().
@@ -2559,10 +2594,10 @@ function OverlayContent() {
 
       try {
         await invoke("take_screenshot", {
-          x:      Math.round(rect.x * dpr) + ox,
-          y:      Math.round(rect.y * dpr) + oy,
-          width:  Math.round(rect.w * dpr),
-          height: Math.round(rect.h * dpr),
+          x:      physX + ox,
+          y:      physY + oy,
+          width:  physW,
+          height: physH,
         });
       } catch (err) {
         console.error("Screenshot failed:", err);
