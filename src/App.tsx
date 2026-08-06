@@ -57,7 +57,6 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Settings />} />
         <Route path="/overlay" element={<Overlay />} />
-        <Route path="/thumbnail" element={<Thumbnail />} />
       </Routes>
     </ErrorBoundary>
   );
