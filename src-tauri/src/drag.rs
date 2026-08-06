@@ -19,7 +19,7 @@ pub fn cleanup_drag_temp_dir() {
 }
 
 /// Result of a drag operation. `true` means the user actually dropped onto a
-/// target (Discord, Explorer, a browser…); `false` means the drag was
+/// target (Discord, Explorer, a browser, terminal…); `false` means the drag was
 /// cancelled (Esc, drop on empty area, drop on a non-accepting window).
 #[command]
 pub fn start_drag(app: AppHandle, path: String) -> Result<bool, String> {
@@ -103,6 +103,7 @@ fn windows_drag(path: &str) -> Result<bool, String> {
         }
     }
 
+    /// Enumerates offered OLE data formats (`CF_HDROP`, `CF_UNICODETEXT`, `CF_TEXT`).
     #[implement(IEnumFORMATETC)]
     struct FormatEnumerator {
         index: Cell<usize>,
@@ -195,6 +196,9 @@ fn windows_drag(path: &str) -> Result<bool, String> {
         }
     }
 
+    /// Implements `IDataObject` for native Windows drag-and-drop operations.
+    /// Exposes `CF_HDROP`, `CF_UNICODETEXT`, and `CF_TEXT` formats to support
+    /// drop targets ranging from file explorers to terminal emulators.
     #[implement(IDataObject)]
     struct FileDragData {
         path: String,
@@ -536,6 +540,96 @@ fn windows_drag(path: &str) -> Result<bool, String> {
         } else {
             Err(format!("DoDragDrop failed: 0x{:08x}", hr.0 as u32))
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[cfg(test)]
+mod windows_ole_tests {
+    use super::*;
+
+    #[test]
+    fn test_format_enumerator_next_skip_reset_clone() {
+        let enumerator = IEnumFORMATETC::from(FormatEnumerator {
+            index: Cell::new(0),
+        });
+        let mut fmt = FORMATETC::default();
+        let mut fetched = 0u32;
+        let hr = unsafe { enumerator.Next(1, &mut fmt, &mut fetched) };
+        assert_eq!(hr, HRESULT(0));
+        assert_eq!(fetched, 1);
+        assert_eq!(fmt.cfFormat, CF_HDROP.0);
+
+        let hr = unsafe { enumerator.Next(1, &mut fmt, &mut fetched) };
+        assert_eq!(hr, HRESULT(0));
+        assert_eq!(fetched, 1);
+        assert_eq!(fmt.cfFormat, CF_UNICODETEXT.0);
+
+        let hr = unsafe { enumerator.Next(1, &mut fmt, &mut fetched) };
+        assert_eq!(hr, HRESULT(0));
+        assert_eq!(fetched, 1);
+        assert_eq!(fmt.cfFormat, CF_TEXT.0);
+
+        let hr = unsafe { enumerator.Next(1, &mut fmt, &mut fetched) };
+        assert_eq!(hr, S_FALSE);
+        assert_eq!(fetched, 0);
+
+        assert!(unsafe { enumerator.Reset() }.is_ok());
+
+        let hr = unsafe { enumerator.Next(1, ptr::null_mut(), &mut fetched) };
+        assert_eq!(hr, E_POINTER);
+    }
+
+    #[test]
+    fn test_file_drag_data_supports_cf_text() {
+        let fmt_text = format_etc(CF_TEXT.0);
+        assert!(FileDragData::supports(&fmt_text));
+
+        let fmt_hdrop = format_etc(CF_HDROP.0);
+        assert!(FileDragData::supports(&fmt_hdrop));
+
+        let fmt_unicode = format_etc(CF_UNICODETEXT.0);
+        assert!(FileDragData::supports(&fmt_unicode));
+
+        let fmt_dib = format_etc(8); // CF_DIB
+        assert!(!FileDragData::supports(&fmt_dib));
+    }
+
+    #[test]
+    fn test_file_drag_data_com_methods_null_pointers() {
+        let drag_data = IDataObject::from(FileDragData {
+            path: "C:\\test\\file.png".to_string(),
+        });
+
+        let res = unsafe { drag_data.GetData(ptr::null()) };
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code(), E_POINTER);
+
+        let hr = unsafe { drag_data.QueryGetData(ptr::null()) };
+        assert_eq!(hr, E_POINTER);
+
+        let fmt_dib = format_etc(8);
+        let hr = unsafe { drag_data.QueryGetData(&fmt_dib) };
+        assert_eq!(hr, DV_E_FORMATETC);
+
+        let fmt_text = format_etc(CF_TEXT.0);
+        let hr = unsafe { drag_data.QueryGetData(&fmt_text) };
+        assert_eq!(hr, HRESULT(0));
+    }
+
+    #[test]
+    fn test_cf_text_medium_content() {
+        let drag_data_impl = FileDragData_Impl {
+            path: "C:\\tmp\\test.png".to_string(),
+        };
+        let medium = unsafe { drag_data_impl.cf_text_medium() }.expect("cf_text_medium failed");
+        assert_eq!(medium.tymed, TYMED_HGLOBAL.0 as u32);
+        let hglobal = unsafe { medium.u.hGlobal };
+        let raw = unsafe { GlobalLock(hglobal) } as *const u8;
+        assert!(!raw.is_null());
+        let c_str = unsafe { std::ffi::CStr::from_ptr(raw as *const i8) };
+        assert_eq!(c_str.to_str().unwrap(), "C:\\tmp\\test.png");
+        let _ = unsafe { GlobalUnlock(hglobal) };
     }
 }
 
