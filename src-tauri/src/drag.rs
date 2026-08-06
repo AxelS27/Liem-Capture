@@ -1,5 +1,20 @@
+#[cfg(target_os = "windows")]
 use std::sync::mpsc;
 use tauri::{command, AppHandle};
+
+pub fn cleanup_drag_temp_dir() {
+    let drag_dir = std::env::temp_dir().join("liem-cap2-drag");
+    if drag_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&drag_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+}
 
 /// Result of a drag operation. `true` means the user actually dropped onto a
 /// target (Discord, Explorer, a browser…); `false` means the drag was
@@ -9,9 +24,27 @@ pub fn start_drag(app: AppHandle, path: String) -> Result<bool, String> {
     #[cfg(target_os = "windows")]
     {
         let _ = app;
+        if !std::path::Path::new(&path).is_file() {
+            return Err(format!("Drag source file not found: {path}"));
+        }
+
+        let drag_dir = std::env::temp_dir().join("liem-cap2-drag");
+        std::fs::create_dir_all(&drag_dir).map_err(|e| e.to_string())?;
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let temp_path = drag_dir.join(format!("capture-{timestamp}.png"));
+
+        std::fs::copy(&path, &temp_path)
+            .map_err(|e| format!("Failed to copy capture for drag: {e}"))?;
+
+        let temp_path_str = temp_path.to_string_lossy().to_string();
+
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(windows_drag(&path));
+            let _ = tx.send(windows_drag(&temp_path_str));
         });
 
         return rx
@@ -50,7 +83,7 @@ fn windows_drag(path: &str) -> Result<bool, String> {
                 Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
                 Ole::{
                     DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, OleUninitialize,
-                    CF_HDROP, DROPEFFECT, DROPEFFECT_COPY,
+                    CF_HDROP, CF_UNICODETEXT, DROPEFFECT, DROPEFFECT_COPY,
                 },
                 SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS},
             },
@@ -58,9 +91,9 @@ fn windows_drag(path: &str) -> Result<bool, String> {
         },
     };
 
-    fn hdrop_format() -> FORMATETC {
+    fn format_etc(cf_format: u16) -> FORMATETC {
         FORMATETC {
-            cfFormat: CF_HDROP.0,
+            cfFormat: cf_format,
             ptd: ptr::null_mut(),
             dwAspect: DVASPECT_CONTENT.0,
             lindex: -1,
@@ -70,7 +103,7 @@ fn windows_drag(path: &str) -> Result<bool, String> {
 
     #[implement(IEnumFORMATETC)]
     struct FormatEnumerator {
-        emitted: Cell<bool>,
+        index: Cell<usize>,
     }
 
     impl IEnumFORMATETC_Impl for FormatEnumerator_Impl {
@@ -79,14 +112,19 @@ fn windows_drag(path: &str) -> Result<bool, String> {
                 return E_POINTER;
             }
 
-            let mut fetched = 0;
-            if celt > 0 && !self.emitted.get() {
+            let formats = [CF_HDROP.0, CF_UNICODETEXT.0];
+            let mut fetched = 0u32;
+            let mut cur = self.index.get();
+
+            while cur < formats.len() && fetched < celt {
                 unsafe {
-                    ptr::write(rgelt, hdrop_format());
+                    ptr::write(rgelt.add(fetched as usize), format_etc(formats[cur]));
                 }
-                self.emitted.set(true);
-                fetched = 1;
+                fetched += 1;
+                cur += 1;
             }
+
+            self.index.set(cur);
 
             unsafe {
                 if !pceltfetched.is_null() {
@@ -102,20 +140,19 @@ fn windows_drag(path: &str) -> Result<bool, String> {
         }
 
         fn Skip(&self, celt: u32) -> WinResult<()> {
-            if celt > 0 && !self.emitted.get() {
-                self.emitted.set(true);
-            }
+            let new_idx = (self.index.get() + celt as usize).min(2);
+            self.index.set(new_idx);
             Ok(())
         }
 
         fn Reset(&self) -> WinResult<()> {
-            self.emitted.set(false);
+            self.index.set(0);
             Ok(())
         }
 
         fn Clone(&self) -> WinResult<IEnumFORMATETC> {
             Ok(IEnumFORMATETC::from(FormatEnumerator {
-                emitted: Cell::new(self.emitted.get()),
+                index: Cell::new(self.index.get()),
             }))
         }
     }
@@ -127,7 +164,7 @@ fn windows_drag(path: &str) -> Result<bool, String> {
 
     impl FileDragData {
         fn supports(format: &FORMATETC) -> bool {
-            format.cfFormat == CF_HDROP.0
+            (format.cfFormat == CF_HDROP.0 || format.cfFormat == CF_UNICODETEXT.0)
                 && format.dwAspect == DVASPECT_CONTENT.0
                 && (format.tymed & TYMED_HGLOBAL.0 as u32) != 0
         }
@@ -170,6 +207,33 @@ fn windows_drag(path: &str) -> Result<bool, String> {
                 pUnkForRelease: ManuallyDrop::new(None),
             })
         }
+
+        unsafe fn unicode_text_medium(&self) -> WinResult<STGMEDIUM> {
+            let mut wide_path: Vec<u16> = self.path.encode_utf16().collect();
+            wide_path.push(0);
+
+            let byte_len = wide_path.len() * std::mem::size_of::<u16>();
+            let hglobal = GlobalAlloc(GMEM_MOVEABLE, byte_len)?;
+            let raw = GlobalLock(hglobal);
+
+            if raw.is_null() {
+                return Err(Error::from_win32());
+            }
+
+            ptr::copy_nonoverlapping(
+                wide_path.as_ptr(),
+                raw as *mut u16,
+                wide_path.len(),
+            );
+
+            let _ = GlobalUnlock(hglobal);
+
+            Ok(STGMEDIUM {
+                tymed: TYMED_HGLOBAL.0 as u32,
+                u: STGMEDIUM_0 { hGlobal: hglobal },
+                pUnkForRelease: ManuallyDrop::new(None),
+            })
+        }
     }
 
     impl IDataObject_Impl for FileDragData_Impl {
@@ -179,7 +243,14 @@ fn windows_drag(path: &str) -> Result<bool, String> {
                     return Err(Error::from_hresult(DV_E_FORMATETC));
                 }
 
-                self.hdrop_medium()
+                let fmt = &*pformatetcin;
+                if fmt.cfFormat == CF_HDROP.0 {
+                    self.hdrop_medium()
+                } else if fmt.cfFormat == CF_UNICODETEXT.0 {
+                    self.unicode_text_medium()
+                } else {
+                    Err(Error::from_hresult(DV_E_FORMATETC))
+                }
             }
         }
 
@@ -226,7 +297,7 @@ fn windows_drag(path: &str) -> Result<bool, String> {
         fn EnumFormatEtc(&self, dwdirection: u32) -> WinResult<IEnumFORMATETC> {
             if dwdirection == DATADIR_GET.0 as u32 {
                 Ok(IEnumFORMATETC::from(FormatEnumerator {
-                    emitted: Cell::new(false),
+                    index: Cell::new(0),
                 }))
             } else {
                 Err(Error::from_hresult(DV_E_FORMATETC))
@@ -302,5 +373,29 @@ fn windows_drag(path: &str) -> Result<bool, String> {
         } else {
             Err(format!("DoDragDrop failed: 0x{:08x}", hr.0 as u32))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::Write;
+
+    #[test]
+    fn test_cleanup_drag_temp_dir() {
+        let drag_dir = std::env::temp_dir().join("liem-cap2-drag");
+        std::fs::create_dir_all(&drag_dir).unwrap();
+
+        let dummy_file = drag_dir.join("capture-123456789.png");
+        {
+            let mut f = File::create(&dummy_file).unwrap();
+            writeln!(f, "dummy data").unwrap();
+        }
+        assert!(dummy_file.exists());
+
+        cleanup_drag_temp_dir();
+
+        assert!(!dummy_file.exists());
     }
 }
