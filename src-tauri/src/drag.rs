@@ -2,6 +2,8 @@
 use std::sync::mpsc;
 use tauri::{command, AppHandle};
 
+/// Sweeps `%TEMP%\liem-cap2-drag\` and deletes any leftover drag temporary files
+/// from previous sessions. Called during application setup.
 pub fn cleanup_drag_temp_dir() {
     let drag_dir = std::env::temp_dir().join("liem-cap2-drag");
     if drag_dir.exists() {
